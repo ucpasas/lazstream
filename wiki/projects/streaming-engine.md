@@ -2,15 +2,15 @@
 title: Streaming Engine
 type: project
 status: active
-updated: 2026-05-10
-tags: [streaming, http2, range-request, back-pressure, scheduling, events]
+updated: 2026-05-12
+tags: [streaming, http2, range-request, back-pressure, scheduling, events, workers, priority]
 ---
 
 # Streaming Engine
 
 Pipeline orchestrator: `[[Manifest Loader]] → Streaming Engine → [[Decoder Workers]] → [[Renderer]]`.
 
-In Phase 1, `StreamingEngine` (`src/engine/streaming-engine.ts`) is the top-level pipeline coordinator. It drives the manifest loading sequence and delivers seed points to the renderer via callbacks. In Phase 2 it will add chunk scheduling, batching, and worker dispatch.
+In Phase 1, `StreamingEngine` (`src/engine/streaming-engine.ts`) is the top-level pipeline coordinator. It drives the manifest loading sequence and delivers seed points to the renderer via callbacks. Phase 2 adds worker pool initialisation, camera-driven chunk prioritisation, and a progressive decode loop.
 
 ---
 
@@ -36,32 +36,65 @@ This is the `@lazstream/core` SDK boundary — the UI layer registers callbacks;
 
 ---
 
-## Phase 2 responsibilities (planned)
+## Phase 2 role (implemented — Track A)
 
-1. Accept a prioritised queue of chunk descriptors (priority driven by [[Spatial Index]] frustum culling).
-2. Coalesce adjacent or nearby chunk byte ranges into 2–4 MB batches to amortise HTTP/2 overhead.
-3. Issue range requests and stream response bodies without buffering the entire batch.
-4. Apply back-pressure: pause fetching when the decoder worker queue is full.
-5. Check [[Chunk Caching]] before issuing a network request — serve from IndexedDB if present.
-6. Report byte-level progress for UI bandwidth indicators.
+Phase 2 extends the `load()` method with a second pipeline stage after seeds are delivered:
+
+```typescript
+// Phase 1 pipeline (unchanged):
+URL → probe → header → chunk table → seed points → onSeedsReady
+
+// Phase 2 additions:
+seed points → ChunkPrioritiser → WorkerPool.init() → onChunkDecoded (per chunk)
+```
+
+### New load states
+
+```typescript
+type LoadState = 'idle' | 'probing' | 'header' | 'chunk-table' | 'seeds'
+               | 'workers-init'   // ← Phase 2: initialising worker pool
+               | 'streaming'      // ← Phase 2: workers decoding
+               | 'ready' | 'error'
+```
+
+### Worker count
+
+```typescript
+this.workerCount = workerCount ?? Math.min(4, Math.max(1, navigator.hardwareConcurrency - 1))
+```
+
+Capped at 4 to match HTTP/1.1 connection limits for R2 (see [[Decoder Workers]]). The same cap is applied independently in `WorkerPool` so both agree.
+
+### Camera-driven decode: `updateCamera()`
+
+```typescript
+engine.updateCamera(cameraWorldX, cameraWorldY, cameraWorldZ)
+```
+
+Call every frame from the render loop. The engine asks `ChunkPrioritiser` to rank undecoded chunks by inverse distance to camera, then submits the top `maxQueuedChunks` (default 16) to the worker pool. The pool deduplicates — safe to call every frame.
+
+### Decode-all shortcut: `decodeAll()`
+
+```typescript
+engine.decodeAll()
+```
+
+Submits every chunk regardless of camera position. Used in Phase 2 validation to trigger full decode after seeds are ready, before the camera-driven loop is connected.
+
+### Scene centre
+
+The engine computes the centroid of all seed points and passes it to `ChunkPrioritiser`. The renderer's `getSceneCenter()` exposes it so the renderer can use the same coordinate origin.
 
 ---
 
-## Batching strategy (Phase 2)
+## Phase 3 responsibilities (planned)
 
-- Target batch size: 2–4 MB.
-- Merge chunks if gap between them < 64 KB.
-- Maximum chunks per batch: configurable, default 32.
-- Priority order: frustum-visible chunks first (from [[Spatial Index]]), then LidarScout seed chunks.
-
----
-
-## Back-pressure (Phase 2)
-
-- Decoder worker pool exposes a `capacity` signal (available worker slots).
-- Streaming engine pauses scheduling when `capacity === 0`.
-- Resume on `workerAvailable` event.
-- Never drop chunks — pause, do not discard.
+1. HTTP/2 fetch coalescing: merge adjacent chunk byte ranges into 2–4 MB batches.
+2. Batch size adapts dynamically to measured network throughput.
+3. Back-pressure: pause scheduling when worker queue is saturated.
+4. Check [[Chunk Caching]] before issuing a network request.
+5. Move fetch to main thread (Option B model) so ranges can be coalesced across chunks.
+6. AbortController threading through all fetch calls (loading a new URL while streaming must cancel the previous engine).
 
 ---
 
@@ -77,8 +110,8 @@ This is the `@lazstream/core` SDK boundary — the UI layer registers callbacks;
 ## Open questions
 
 - [ ] How to handle HTTP 206 vs 200 responses from origins that ignore range headers?
-- [ ] Should batch size adapt dynamically to measured network throughput?
-- [ ] AbortController: Phase 1 has no cancellation — loading a new URL while seeds fetch lets the old engine run. Phase 2 must thread AbortController through all fetch calls.
+- [ ] AbortController: Phase 1/2 have no cancellation — loading a new URL while streaming lets the old engine run. Phase 3 must thread AbortController through all fetch calls.
+- [ ] Frustum culling integration: currently `updateCamera()` uses inverse distance only; connect to [[Spatial Index]] for true frustum culling in Phase 3.
 
 ---
 

@@ -1,8 +1,8 @@
 ---
 title: Ring Buffer GPU Memory
 type: concept
-status: draft
-updated: 2026-05-09
+status: active
+updated: 2026-05-13
 tags: [webgpu, gpu-memory, ring-buffer, lru, eviction]
 ---
 
@@ -36,33 +36,38 @@ GPUBuffer (256 MB, usage: STORAGE | COPY_DST)
 
 ---
 
-## Slot table (CPU-side)
+## Slot table (CPU-side) — `src/render/ring-buffer.ts`
 
-```ts
+Pure TypeScript, no WebGPU types. Fully unit-testable in isolation.
+
+```typescript
 interface Slot {
-  chunkIndex: number;
-  byteOffset: number;
-  byteLength: number;
-  pointCount: number;
-  lastRenderedFrame: number;  // for LRU
+  chunkIndex: number       // LAZ chunk index; -1 for seed pseudo-chunk
+  byteOffset: number       // byte offset into the GPU buffer
+  byteLength: number       // bytes occupied
+  pointCount: number
+  min: [number, number, number]    // world-space dequantization origin
+  range: [number, number, number]  // world-space dequantization range
+  lastRenderedFrame: number        // -1 if never rendered
 }
 ```
 
-The slot table is a simple array sorted by `byteOffset`. The [[Renderer]] updates `lastRenderedFrame` for each chunk it draws.
+`RingBufferAllocator` methods: `allocate()`, `touch()`, `getSlot()`, `remove()`, `getSlots()`, `bytesUsed()`, `pointsLoaded()`.
 
 ---
 
-## Eviction algorithm
+## Eviction algorithm (first-fit + LRU)
 
-1. When a new chunk arrives and the ring pointer would overflow:
-   a. Find the slot with the lowest `lastRenderedFrame` (LRU).
-   b. Assert the chunk is not visible this frame (evicting a visible chunk is a bug).
-   c. Remove the slot from the table.
-   d. Reuse its `byteOffset` for the new chunk (or compact if fragmentation is high).
-2. Write new chunk data with `GPUQueue.writeBuffer(buffer, slot.byteOffset, data)`.
-3. Add new slot to the table.
+`allocate()` runs a loop:
+1. `findFirstFreeRange(byteLength)` — walks slots sorted by `byteOffset`, finds first gap ≥ requested size.
+2. If found: insert new slot, sort by offset, return.
+3. If not found: `findLRUEvictable(currentFrame)` — find slot with lowest `lastRenderedFrame` that is **not** visible this frame (`lastRenderedFrame < currentFrame`).
+4. Remove victim, loop back to step 1.
+5. If no evictable slots (all visible): return `null` — caller drops the chunk silently.
 
-Frame coherence invariant: a chunk visible in the current frame's frustum (queried from [[Spatial Index]]) must never be evicted during that frame. Check `lastRenderedFrame === currentFrame` before eviction.
+Frame-coherence invariant: `lastRenderedFrame >= currentFrame` → protected from eviction. The renderer calls `touch(chunkIndex, currentFrame)` for every slot it dispatches each frame.
+
+**Known v1 limitation:** first-fit allocation fragments over time. If visible slots are scattered, a large new chunk may be refused even when total free bytes exceed its size. GPU-side compaction deferred to Track B v2.
 
 ---
 
@@ -80,15 +85,13 @@ Current decision: sequential ring with no compaction (revisit if fragmentation i
 
 ## GPU buffer binding
 
-The ring buffer is bound as a `storage` buffer in the [[WebGPU Compute]] depth pre-pass and as a vertex buffer in the raster pass:
+The ring buffer is bound as a read-only storage buffer in the depth compute pass:
 
-```ts
-// Compute: bound as read-only storage
-{ binding: 0, resource: { buffer: ringBuffer } }
-
-// Raster: bound as vertex buffer with per-slot offset
-passEncoder.setVertexBuffer(0, ringBuffer, slot.byteOffset, slot.byteLength);
+```typescript
+{ binding: 2, resource: { buffer: ringBuffer } }
 ```
+
+The shader indexes into it via `chunk.pointStrideOffset` (byte offset / 4, stored as u32 in the chunk uniform). There is no vertex buffer binding — points are read directly in the compute shader.
 
 ---
 
@@ -102,8 +105,7 @@ passEncoder.setVertexBuffer(0, ringBuffer, slot.byteOffset, slot.byteLength);
 
 ## Open questions
 
-- [ ] Should budget be user-configurable (e.g., 128 MB for low-end GPUs)?
-- [ ] How to detect GPU OOM before allocating 256 MB? Use `adapter.requestDevice({ requiredLimits: { maxBufferSize: 256MB } })`.
+- [ ] Fragmentation: monitor in practice with large files (Melbourne 2018, 7000 chunks). Add compaction if refusals observed.
 
 ---
 

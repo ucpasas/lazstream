@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "WebFetch(domain:gist.github.com)",
-      "WebFetch(domain:gist.githubusercontent.com)"
+      "WebFetch(domain:gist.githubusercontent.com)",
+      "Bash(xargs -I{} du -sh /home/kisar/src/lazstream/{})"
     ]
   }
 }

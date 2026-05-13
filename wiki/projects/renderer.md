@@ -2,8 +2,8 @@
 title: Renderer
 type: project
 status: active
-updated: 2026-05-10
-tags: [three.js, webgpu, webgl, compute-shader, point-cloud, ring-buffer, seed-points]
+updated: 2026-05-13
+tags: [three.js, webgpu, webgl, compute-shader, point-cloud, ring-buffer, seed-points, dequantization, webgpu-renderer, point-packing, dynamic-offset]
 ---
 
 # Renderer
@@ -41,42 +41,126 @@ The Phase 1 renderer is intentionally minimal — it proves the upstream pipelin
 
 ---
 
-## Phase 2: WebGPU compute shader renderer (planned)
+## Phase 2 Track A: WebGL validation renderer (implemented)
 
-### Responsibilities
+### Purpose
 
-1. Accept `Float32Array` point buffers from [[Decoder Workers]] and upload to the [[Ring Buffer GPU Memory]].
-2. Manage the ring buffer: allocate slots, evict LRU chunks when capacity is exceeded.
-3. Run WebGPU atomicMin depth compute shader (Schütz technique) before the raster pass.
-4. Issue draw calls via Three.js `Points` or custom `BufferGeometry`.
-5. Expose camera frustum state to [[Spatial Index]] so chunk priority is updated per frame.
-6. Handle device lost / context restored events.
+Rather than building the WebGPU compute shader renderer blind, Phase 2 Track A was validated using the existing Phase 1 WebGL renderer with one new method: `addDecodedChunk(chunk)`. This confirmed the full decode pipeline (fetch → WASM → quantize → transfer) is correct before touching the GPU pipeline.
 
-### WebGPU compute shader — Schütz atomicMin depth
+### `addDecodedChunk(chunk: DecodedChunk)`
 
-The depth pre-pass runs as a WebGPU compute shader rather than the fixed-function depth buffer:
+Dequantizes `Int16Array` positions back to world coordinates, converts `Uint8Array` RGBA colours to `Float32Array` RGB, then adds the chunk as a new `THREE.Points` object to the scene.
 
-1. Each point is projected to screen space in the compute shader.
-2. `atomicMin` writes the minimum depth value per pixel into a depth texture (packed uint32).
-3. The raster pass reads the depth texture to discard occluded points early.
+```typescript
+// Dequantize Int16 → world coordinate
+const wx = ((chunk.positions[i * 3] + 32768) / 65535) * rangeX + chunk.minX
+// Subtract scene centre for GPU-safe Float32
+positions[i * 3] = wx - this.cx
+```
 
-This avoids overdraw for dense point clouds without requiring a geometry shader. See [[WebGPU Compute]] for full shader design.
+See [[Decoder Workers]] for the forward quantization transform.
 
-### Ring buffer
+### Seed point hiding
 
-- Total GPU budget: 256 MB.
-- Chunks stored as contiguous `Float32Array` slices in a single large `GPUBuffer`.
-- Eviction: LRU — least recently rendered chunk is overwritten when the buffer is full.
-- Ring buffer slot table maintained on CPU; GPU-side layout is purely linear.
+Once 10 or more decoded chunks have arrived, the seed point `THREE.Points` object is hidden (`visible = false`). The 4 px seed splats look coarse next to the 1.5 px decoded points.
 
-See [[Ring Buffer GPU Memory]] for eviction algorithm details.
+### `getCameraWorldPosition()`
 
-### Three.js integration (Phase 2)
+Returns the camera position in world coordinates (scene-relative position + scene centre). Used by `StreamingEngine.updateCamera()` to drive chunk prioritisation.
 
-- Renderer: `WebGPURenderer` (Three.js r168+).
-- Point cloud: `Points` mesh with custom `ShaderNodeMaterial` (TSL) for colour mapping.
-- Camera: `PerspectiveCamera` with orbit controls.
-- Per-frame: frustum extracted from `camera.projectionMatrix × camera.matrixWorldInverse`.
+### Phase 2 Track A performance
+
+| Metric | Value |
+|--------|-------|
+| Chunks decoded | 380 |
+| Points rendered | 18,991,962 |
+| FPS | 76 |
+| Elevation colourmap | correct |
+| Spatial layout | correct |
+
+---
+
+## Phase 2 Track B: WebGPU compute shader renderer (complete)
+
+**Status:** Running. Confirmed on Chrome 120+ (WebGPU). 19M point Texas tile at ~76 fps.
+
+### Files
+
+| File | Purpose |
+|------|---------|
+| `src/render/webgpu-renderer.ts` | Main class — pipeline, frame loop, slot management |
+| `src/render/webgpu-context.ts` | Device + canvas acquisition, ring buffer capacity negotiation |
+| `src/render/ring-buffer.ts` | CPU-side slot allocator (pure TS, no WebGPU types) |
+| `src/render/point-packing.ts` | DecodedChunk → packed Uint32Array (12 bytes/point) |
+| `src/render/shaders/points-depth.wgsl` | Compute: project + atomicMin depth per point |
+| `src/render/shaders/clear-depth.wgsl` | Compute: reset depth buffer to 0xFFFFFFFF each frame |
+| `src/render/shaders/resolve-edl.wgsl` | Render: fullscreen triangle, resolve depth+color, EDL |
+
+### Architecture decisions (vs. pre-implementation plan)
+
+| Decision | Planned | Actual |
+|----------|---------|--------|
+| Three.js integration | WebGPURenderer + TSL | Three.js for camera/controls only; raw WebGPU for all passes |
+| Depth buffer type | `texture_storage_2d<r32uint>` + `textureAtomicMin` | `array<atomic<u32>>` storage buffer — better cross-vendor support |
+| Dispatch model | One dispatch for all points | One compute dispatch per chunk slot, dynamic uniform offset |
+| Color/depth write race | N/A | Benign race accepted — color written non-atomically when atomicMin wins |
+
+### Frame loop (per frame)
+
+1. `controls.update()` + `writeCameraUniform()` — viewProj matrix + sceneCenter + viewport to GPU
+2. **Clear depth compute pass** — `ceil(pixelCount / 256)` workgroups, resets depth to `0xFFFFFFFF`
+3. **Points depth compute pass** — for each slot: `setBindGroup` with dynamic offset → `dispatchWorkgroups(ceil(pointCount / 128))` → `touch(slot, frame)`
+4. **Resolve render pass** — fullscreen triangle (3 vertices, no mesh), fragment shader reads depth+color buffers, applies 4-neighbour log-depth EDL, outputs to canvas
+5. `queue.submit([encoder.finish()])`
+
+### GPU memory layout
+
+- Ring buffer: single `GPUBuffer`, `STORAGE | COPY_DST`, 256 MB (128 MB fallback for integrated GPUs)
+- Depth buffer: `array<atomic<u32>>`, one u32 per pixel, viewport-sized, recreated on resize
+- Color buffer: `array<u32>`, one u32 per pixel (RGBA8 packed), viewport-sized, recreated on resize
+- Point format: 12 bytes/point — `u32(y<<16|x)` | `u32(z)` | `u32(rgba)`
+- Chunk uniform: 32 bytes — `vec3<f32> minXYZ` | `u32 pointCount` | `vec3<f32> rangeXYZ` | `u32 pointStrideOffset` — bound with dynamic offset (stride = device alignment, typically 256 bytes)
+
+### Public interface (unchanged from Track A)
+
+```typescript
+static async create(canvas, options?): Promise<WebGPURenderer>  // async factory
+loadSeedPoints(seeds: SeedPoint[]): void
+addDecodedChunk(chunk: DecodedChunk): void
+getCameraWorldPosition(): { x, y, z }
+getSceneCenter(): { x, y, z }
+dispose(): void
+```
+
+`WebGPUUnsupportedError` is re-exported from `webgpu-renderer.ts` so callers need only one import.
+
+### main.ts changes
+
+- `WebGPURenderer.create()` is async — entire setup wrapped in `async function main()`
+- `WebGPUUnsupportedError` caught at startup — shows user-facing error, disables load button, returns early. No WebGL fallback (deferred to Phase 5).
+- All engine callbacks unchanged — same `onSeedsReady` / `onChunkDecoded` wiring
+
+### Seed point handling
+
+Seeds are packed via `packSeedsAsChunk()` and added as a pseudo-chunk (`chunkIndex = -1`). Auto-evicted once 10 real chunks have landed (`SEED_HIDE_THRESHOLD = 10`).
+
+### Performance (Texas tile, HTTP/1.1 R2)
+
+| Metric | Value |
+|--------|-------|
+| Points rendered | 18,991,962 |
+| Chunks | 380 |
+| FPS | ~76 |
+| WebGPU confirmed | `canvas.getContext('webgpu')` → `GPUCanvasContext` |
+
+### Known limitations entering Phase 3
+
+- Melbourne 2018 (353M pts, 7000+ chunks): page unresponsive — `decodeAll()` / `updateCamera()` queues too many chunks before the main thread gets a tick. Requires Phase 3 frame-amortised decode budget + back-pressure.
+- R2 r2.dev is HTTP/1.1 only — seed TTFF dominated by round trips. HTTP/2 requires a custom Cloudflare domain.
+- No frustum culling at chunk level — all loaded chunks dispatched every frame regardless of visibility (Phase 3: rbush integration)
+- No WebGL fallback (Phase 5)
+- Device lost: logs only, no recovery (Phase 5)
+- Splat size fixed at 1×1 pixel (Phase 5)
 
 ---
 
@@ -90,10 +174,10 @@ See [[Ring Buffer GPU Memory]] for eviction algorithm details.
 
 ## Open questions
 
-- [ ] TSL (Three.js Shading Language) vs raw WGSL for the depth compute shader?
-- [ ] How to handle WebGPU unavailability — WebGL fallback or hard error?
-- [ ] Point size attenuation: distance-based or fixed?
-- [ ] Eye-dome lighting (Phase 2 target): post-process pass to mask density variation.
+- [ ] WebGL fallback factory `createRenderer(canvas)` — Phase 5
+- [ ] Device lost / context restored recovery — Phase 5
+- [ ] Point splat size attenuation — Phase 5
+- [ ] Frustum culling: connect to [[Spatial Index]] for whole-chunk rejection — Phase 3
 
 ---
 

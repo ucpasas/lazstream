@@ -1,9 +1,9 @@
 ---
 title: WebGPU Compute
 type: concept
-status: draft
-updated: 2026-05-09
-tags: [webgpu, compute-shader, wgsl, depth, atomicmin, schutz]
+status: active
+updated: 2026-05-13
+tags: [webgpu, compute-shader, wgsl, depth, atomicmin, schutz, storage-buffer, dynamic-offset]
 ---
 
 # WebGPU Compute
@@ -35,53 +35,59 @@ Because IEEE 754 floats in `[0, 1]` preserve order under bit-cast to uint32, `at
 
 ---
 
-## WGSL sketch
+## Implementation (points-depth.wgsl)
 
-```wgsl
-@group(0) @binding(0) var<storage, read> points: array<vec4f>;
-@group(0) @binding(1) var depthImage: texture_storage_2d<r32uint, read_write>;
-@group(0) @binding(2) var<uniform> mvp: mat4x4f;
+The actual implementation uses a **storage buffer** (`array<atomic<u32>>`) rather than `texture_storage_2d` + `textureAtomicMin`. The `texture-atomic` WebGPU extension has inconsistent vendor support; the storage buffer approach works on all WebGPU-capable hardware.
 
-@compute @workgroup_size(64)
-fn depthPrepass(@builtin(global_invocation_id) id: vec3u) {
-  let idx = id.x;
-  if (idx >= arrayLength(&points)) { return; }
+### Bindings
 
-  let pos = mvp * vec4f(points[idx].xyz, 1.0);
-  if (pos.w <= 0.0) { return; }
+| Binding | Type | Contents |
+|---------|------|----------|
+| 0 | `uniform` | `CameraUniform` — viewProj mat4, viewportSize vec2, sceneCenter vec3 |
+| 1 | `uniform` (dynamic offset) | `ChunkUniform` — minXYZ, pointCount, rangeXYZ, pointStrideOffset |
+| 2 | `storage, read` | Ring buffer — packed point data (`array<u32>`) |
+| 3 | `storage, read_write` | Depth buffer — `array<atomic<u32>>`, one u32 per pixel |
+| 4 | `storage, read_write` | Color buffer — `array<u32>`, one u32 per pixel |
 
-  let ndc = pos.xyz / pos.w;
-  if (any(abs(ndc.xy) > vec2f(1.0)) || ndc.z < 0.0 || ndc.z > 1.0) { return; }
+### Per-point pipeline
 
-  let dims = textureDimensions(depthImage);
-  let px = u32((ndc.x * 0.5 + 0.5) * f32(dims.x));
-  let py = u32((1.0 - (ndc.y * 0.5 + 0.5)) * f32(dims.y));
+1. Unpack Int16 XYZ from packed u32 halves (sign-extend via bit-twiddling)
+2. Dequantize: `worldPos = ((q + 32768) / 65535) * rangeXYZ + minXYZ`
+3. Subtract `sceneCenter` — scene-local Float32 (avoids precision loss on large UTM coords)
+4. Multiply by `viewProj` — clip space
+5. Per-point frustum cull (clip.w ≤ 0, NDC outside ±1, depth outside 0–1)
+6. Map NDC → pixel coordinates (Y-flip: NDC Y up, screen Y down)
+7. `atomicMin(&depthBuffer[pixelIdx], bitcast<u32>(ndc.z))`
+8. If we won (`depthBits < prev`): write color non-atomically. Race is benign.
 
-  let depthBits = bitcast<u32>(ndc.z);
-  textureAtomicMin(depthImage, vec2u(px, py), depthBits);
-}
-```
+### Dynamic offset dispatch
 
-Note: `textureAtomicMin` requires WebGPU with the `texture-atomic` extension. Check device feature support at init time.
+One `setBindGroup(..., [uniformIdx * chunkUniformStride])` + `dispatchWorkgroups(ceil(pointCount / 128))` per slot per frame. Avoids recreating bind groups between chunks.
+
+### Why IEEE 754 bitcast works for depth comparison
+
+Floats in `[0, 1]` with the same sign preserve sort order when reinterpreted as `u32`. `atomicMin` on the bit-cast uint is therefore equivalent to `min` on the original float. Only valid for positive depths — which NDC z ∈ [0, 1] guarantees.
 
 ---
 
 ## Three.js integration
 
-Three.js r168+ exposes `WebGPURenderer` and TSL (Three Shading Language). The compute pass is a `ComputeNode` that runs before the scene render:
+Three.js is used **only** for `PerspectiveCamera` and `OrbitControls`. The WebGPU device, pipelines, and passes are created directly via the WebGPU API — not via `THREE.WebGPURenderer` or TSL. This avoids Three.js abstraction overhead and gives direct control over bind group layouts and dynamic offsets.
 
-```ts
-const depthPass = tsl.Fn(() => { /* ... */ })().toComputeNode(pointCount / 64);
-renderer.computeAsync(depthPass);
+The `viewProj` matrix is extracted each frame via:
+```typescript
+this.viewProj.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse)
 ```
 
 ---
 
 ## Device support
 
-- WebGPU with `texture-atomic` is required.
-- Fallback: if WebGPU is unavailable, surface a clear error (no WebGL fallback planned).
-- Feature detection: `adapter.features.has('texture-atomic')`.
+- Requires WebGPU (Chrome 120+, Edge 120+). Confirmed working on Windows with discrete GPU.
+- `WebGPUUnsupportedError` thrown if `navigator.gpu` absent, no adapter, or canvas context fails.
+- 128 MB minimum `maxStorageBufferBindingSize` enforced — below this, depth + color buffers at 4K would exceed limits.
+- 256 MB ring buffer negotiated at device creation; falls back to 128 MB for integrated GPUs.
+- The `powerPreference: 'high-performance'` hint is passed to `requestAdapter()` but ignored on some platforms (logged as a Vite warning — benign).
 
 ---
 
