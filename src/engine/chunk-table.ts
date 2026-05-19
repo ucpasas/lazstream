@@ -13,8 +13,22 @@
  * Procedure (from LASzip lasreadpoint.cpp read_chunk_table):
  *   1. chunk_starts[0] = pointDataOffset + 8  (right after the pointer)
  *   2. For i = 1..N: chunk_starts[i] = ic.decompress(prev, context=1)
- *   3. For i = 1..N: chunk_starts[i] += chunk_starts[i-1]  (accumulate)
+ *   3. For i = 1..N: chunk_starts[i] += chunk_starts[i-1]  (U32 wrap-around)
  *   After step 3, chunk_starts[i] is the absolute byte offset of chunk i.
+ *
+ * MELBOURNE FIX (Phase 3, second pass): all arithmetic in the decode and
+ * accumulation loop is uint32. The previous version used Int32Array for
+ * deltas, which produced negative signed-interpretation values once delta
+ * magnitudes crossed 2^31. The subsequent accumulation
+ * `chunkStarts[i - 1] + deltas[i]` then went backwards in JS Number space,
+ * producing negative chunk sizes when stored back through Uint32Array →
+ * Number coercion. The decoder itself was correct — bug was in the
+ * accumulation path. For Texas (2.1 GB file or smaller) it never showed
+ * because U32 values fit in I32 range; for Melbourne (2.93 GB) the
+ * cumulative offset crosses 2^31 around chunk 287 and the bug manifests.
+ *
+ * The fix: use Uint32Array for deltas as well, and explicitly coerce the
+ * accumulation through `(a + b) >>> 0` to match C++ U32 wrap semantics.
  */
 
 import type { LasHeader, LazVlr, ChunkTableEntry, SeedPoint } from '../types/las.js'
@@ -82,9 +96,6 @@ export async function fetchChunkTable(
   })
 
   // ── Step 2: Fetch from chunk table offset to EOF ──────────────────────────
-  // The compressed chunk table is small (typically < 2KB for 400 chunks).
-  // Fetch everything from the table to EOF so the arithmetic decoder
-  // has all the bytes it needs.
 
   const chunkTableBuffer = await fetchRange(url, chunkTableAbsoluteOffset, fileSize - 1)
   const chunkTableView = new DataView(chunkTableBuffer)
@@ -124,17 +135,10 @@ export async function fetchChunkTable(
 
   // ── Step 4: Decompress chunk table entries ────────────────────────────────
   //
-  // From LASzip read_chunk_table():
-  //   dec->init(instream);
-  //   IntegerCompressor ic(dec, 32, 2);
-  //   ic.initDecompressor();
-  //   for (i = 1; i <= number_chunks; i++)
-  //     chunk_starts[i] = ic.decompress((i>1 ? (U32)(chunk_starts[i-1]) : 0), 1);
-  //   dec->done();
-  //   for (i = 1; i <= number_chunks; i++)
-  //     chunk_starts[i] += chunk_starts[i-1];
-  //
-  // The compressed data starts at offset 8 in our buffer (after version + count).
+  // All arithmetic is uint32. The decoder returns numbers in [-2^31, 2^32) —
+  // signed-interpretation when high bit set. Uint32Array storage normalises
+  // these to unsigned [0, 2^32). The accumulation `a + b >>> 0` mirrors C++
+  // U32 wrap-around addition.
 
   const compressedData = new Uint8Array(
     chunkTableBuffer,
@@ -148,46 +152,65 @@ export async function fetchChunkTable(
   const ic = new IntegerDecompressor(dec, 32, 2, 8)
   ic.initDecompressor()
 
-  // Decompress delta-coded chunk sizes using context 1
-  // chunk_starts[0] is implicit = CHUNK_DATA_START
-  // For i >= 1, decompress returns a delta value
-  const chunkStarts = new Array<number>(chunkCount + 1)
-  chunkStarts[0] = CHUNK_DATA_START
+  // Uint32Array: deltas are 32-bit unsigned values that wrap mod 2^32.
+  // The decoder may return negative-signed-interpretation numbers; storing
+  // through Uint32Array normalises them to their unsigned bit pattern.
+  const deltas = new Uint32Array(chunkCount + 1)
 
-  const deltas = new Array<number>(chunkCount + 1)
-  deltas[0] = 0
-
+  const t0 = performance.now()
   for (let i = 1; i <= chunkCount; i++) {
-    const pred = i > 1 ? (deltas[i - 1] >>> 0) : 0
+    const pred = i > 1 ? deltas[i - 1] : 0   // Uint32Array reads are always unsigned
     deltas[i] = ic.decompress(pred, 1)
   }
+  const decodeMs = performance.now() - t0
+  console.log(
+    `[lazstream] arithmetic decode: ${chunkCount} entries in ${decodeMs.toFixed(1)}ms ` +
+    `(${(decodeMs / chunkCount * 1000).toFixed(2)}µs/entry)`
+  )
 
-  // Accumulate deltas to get absolute byte offsets
+  // Accumulate deltas to get absolute byte offsets.
+  // `(a + b) >>> 0` keeps the addition in uint32 space, matching C++ U32 wrap.
+  // For Melbourne (2.93 GB), cumulative offsets cross 2^31 around chunk 287 —
+  // without the explicit `>>> 0`, JS would produce negative Number values.
+  const chunkStarts = new Uint32Array(chunkCount + 1)
+  chunkStarts[0] = CHUNK_DATA_START
   for (let i = 1; i <= chunkCount; i++) {
-    chunkStarts[i] = chunkStarts[i - 1] + deltas[i]
+    chunkStarts[i] = (chunkStarts[i - 1] + deltas[i]) >>> 0
   }
 
-  // Log first few entries for debugging
   console.debug('[lazstream] first 5 chunk offsets:', {
-    offsets: chunkStarts.slice(0, 5),
-    sizes: chunkStarts.slice(1, 5).map((s, i) => s - chunkStarts[i]),
+    offsets: Array.from(chunkStarts.slice(0, 5)),
+    sizes: Array.from(chunkStarts.slice(1, 5)).map((s, i) => s - chunkStarts[i]),
   })
 
   // ── Step 5: Build chunk entries ───────────────────────────────────────────
+  //
+  // Sizes computed as `(next - this) >>> 0` for uint32 wrap safety. A
+  // genuinely-wrong offset would still appear as a huge positive value
+  // here — the `compressedSize > fileSize` guard below catches that.
 
   const entries: ChunkTableEntry[] = []
 
   for (let i = 0; i < chunkCount; i++) {
     const offset = chunkStarts[i]
-    const compressedSize = chunkStarts[i + 1] - chunkStarts[i]
+    const compressedSize = (chunkStarts[i + 1] - chunkStarts[i]) >>> 0
 
-    if (compressedSize <= 0) {
-      console.warn(`[lazstream] chunk ${i}: non-positive size ${compressedSize} — stopping`)
+    if (compressedSize === 0) {
+      console.warn(`[lazstream] chunk ${i}: zero size — stopping`)
       break
     }
 
     if (compressedSize > fileSize) {
-      console.warn(`[lazstream] chunk ${i}: size ${compressedSize} exceeds file — stopping`)
+      console.warn(
+        `[lazstream] chunk ${i}: size ${compressedSize} exceeds file size ${fileSize} — stopping`
+      )
+      break
+    }
+
+    if (offset >= fileSize) {
+      console.warn(
+        `[lazstream] chunk ${i}: offset ${offset} beyond file size ${fileSize} — stopping`
+      )
       break
     }
 
@@ -199,6 +222,13 @@ export async function fetchChunkTable(
 
   if (entries.length === 0) {
     throw new ChunkTableError('No valid chunk entries after decompression.')
+  }
+
+  if (entries.length < chunkCount) {
+    console.warn(
+      `[lazstream] only ${entries.length} of ${chunkCount} chunks produced ` +
+      `valid offsets — proceeding with partial set`
+    )
   }
 
   // Validate: last chunk should end near the chunk table
@@ -219,13 +249,19 @@ export async function fetchChunkTable(
 
   // The gap between last chunk and chunk table should be small
   // (0 for most files, but some have EVLRs or padding between)
-  if (gapToTable < -1024) {
+  if (Math.abs(gapToTable) > 1024) {
     console.warn(
-      `[lazstream] chunk offsets overshoot chunk table by ${-gapToTable} bytes — ` +
+      `[lazstream] chunk offsets overshoot/undershoot chunk table by ${gapToTable} bytes — ` +
       `decompression may have errors`
     )
   }
 
+  const sampleIndices = [1, 2, 3, 100, 200, 286, 287, 288, 293, 294, 295]
+  for (const i of sampleIndices) {
+    if (i <= chunkCount) {
+      console.log(`[lazstream] delta[${i}] = ${deltas[i]} (0x${deltas[i].toString(16)})`)
+    }
+  }
   return entries
 }
 
@@ -249,7 +285,20 @@ export async function fetchSeedPoints(
   // Variable-size chunks: seed point starts at chunk offset + 4 (preceded by point count)
   const seedByteOffset = (lazVlr.chunkSize === 0) ? 4 : 0
   const seedByteLength = header.pointDataRecordLength
-  const BATCH_SIZE = 6
+  // Seed-fetch concurrency. The previous value of 6 was an HTTP/1.1
+  // connection-limit holdover; on HTTP/2 (data.lazstream.stream), the
+  // browser will multiplex up to ~100 streams over a single connection,
+  // so larger batches just round-trip faster.
+  //
+  // 7073 chunks / batch_size = batch_count, and each batch awaits the
+  // slowest fetch in it. With batch 6 → 1179 sequential rounds × ~30ms
+  // RTT ≈ 5s. With batch 100 → 71 rounds × ~50ms (slightly slower per-
+  // round because more contention but still fast) ≈ 700ms-1.5s.
+  //
+  // Going higher than ~100 hits the browser's per-origin stream cap and
+  // stops paying off. Some browsers cap concurrent fetch() promises
+  // around 100-200 per origin even on HTTP/2.
+  const BATCH_SIZE = 100
 
   console.debug('[lazstream] fetching seed points:', {
     chunkCount: chunks.length,

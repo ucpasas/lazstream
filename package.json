@@ -9,7 +9,9 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "idb-keyval": "^6.2.2",
     "laz-perf": "^0.0.7",
+    "rbush-3d": "^0.0.4",
     "three": "^0.168.0"
   },
   "devDependencies": {

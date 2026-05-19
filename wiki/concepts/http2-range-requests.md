@@ -2,7 +2,7 @@
 title: HTTP/2 Range Requests
 type: concept
 status: active
-updated: 2026-05-10
+updated: 2026-05-16
 tags: [http2, range-request, streaming, coalescing, back-pressure, cors, coop-coep]
 ---
 
@@ -18,7 +18,7 @@ HTTP/1.1 limits connections to ~6 per origin (browser constraint). HTTP/2 multip
 
 Cloud storage origins (S3, R2, Azure Blob, GCS) all support HTTP/2 and `Range` headers.
 
-**Phase 1 note:** Cloudflare R2's `r2.dev` public domain serves HTTP/1.1, not HTTP/2. This caused Phase 1 seed TTFF to be 3–4 s (380 requests × 6-connection limit). Serving from a custom Cloudflare domain (`assets.lazstream.dev`) enables HTTP/2.
+**As of 2026-05-16: HTTP/2 confirmed live on `data.lazstream.stream`** (custom Cloudflare domain over Cloudflare R2). Verified via `curl --http2 -I https://data.lazstream.stream/laz/Melbourne_2018.laz`. r2.dev remains HTTP/1.1-only and is retained only for legacy Phase 1 references.
 
 ---
 
@@ -102,9 +102,10 @@ Back-pressure: if the decoder worker pool is full, pausing `reader.read()` lets 
 
 | Origin | HTTP/2 | Range | Accept-Ranges on HEAD | Notes |
 |--------|--------|-------|-----------------------|-------|
+| `data.lazstream.stream` (R2 + custom domain) | ✓ | ✓ | ✓ | Production hosting; confirmed 2026-05-16 |
 | AWS S3 | ✓ | ✓ | ✓ | Standard |
-| Cloudflare R2 (r2.dev) | ✗ | ✓ | ✗ | HTTP/1.1 on public domain; probe with actual range request |
-| Cloudflare R2 (custom domain) | ✓ | ✓ | ✓ | Preferred for production |
+| Cloudflare R2 (r2.dev) | ✗ | ✓ | ✗ | HTTP/1.1 on public domain; legacy Phase 1 only |
+| Cloudflare R2 (custom domain) | ✓ | ✓ | ✓ | Standard; same as above |
 | Azure Blob | ✓ | ✓ | ✓ | Standard |
 | GCS | ✓ | ✓ | ✓ | Standard |
 | Local dev (Vite) | ✗ | ✓ | ✓ | HTTP/1.1; acceptable for development |
@@ -120,6 +121,46 @@ Access-Control-Expose-Headers: Content-Range, Content-Length
 ```
 
 Without `Access-Control-Expose-Headers: Content-Range`, the browser hides the `Content-Range` response header and file size cannot be read from range responses.
+
+---
+
+## Seed-fetch parallelism (2026-05-19)
+
+`fetchSeedPoints` in `src/engine/chunk-table.ts` issues one tiny range request (~30 bytes) per chunk to read the seed point. With 7073 chunks for Melbourne, this is 7073 individual range requests.
+
+### The bottleneck — BATCH_SIZE 6
+
+Pre-fix code batched 6 requests at a time (an HTTP/1.1-era holdover for the 6-connections-per-origin limit):
+
+```typescript
+const BATCH_SIZE = 6
+for (let i = 0; i < chunks.length; i += BATCH_SIZE) {
+  const buffers = await Promise.all(batch.map(fetchRange))
+  // process...
+}
+```
+
+On HTTP/2 (`data.lazstream.stream`), the browser multiplexes ~100 streams over a single connection, so batching at 6 leaves enormous parallelism on the table:
+
+- 7073 chunks / 6 = 1179 sequential rounds × ~30 ms RTT → **~5 seconds**
+
+### The fix — BATCH_SIZE 100
+
+```typescript
+const BATCH_SIZE = 100
+```
+
+- 7073 chunks / 100 = ~71 rounds × ~50 ms RTT → **700 ms – 1.5 s**
+
+Going above ~100 hits diminishing returns: most browsers cap concurrent `fetch()` promises around 100–200 per origin even on HTTP/2.
+
+### Why range coalescing doesn't help here
+
+Seeds are 30 bytes each but separated by ~400 KB gaps (chunk data between them). Coalescing seed N and seed N+1 into a single range request would fetch ~400 KB to get 60 useful bytes — ratio is too poor to justify. This is unlike chunk fetching (where adjacent chunks are physically adjacent), which is why [[Streaming Engine]]'s `coalesce()` is useful for chunks but not seeds.
+
+### Cache interaction
+
+The IDB cache is not consulted during seed fetch — seeds are small enough that the cache lookup overhead would exceed the network cost. Seeds are re-fetched on every file load. (At 7073 × 30 B = 210 KB total, this is acceptable.)
 
 ---
 

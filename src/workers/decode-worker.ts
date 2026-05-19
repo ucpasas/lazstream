@@ -13,8 +13,16 @@
  *   1. Worker spawns → waits for { type: 'init', lazPerfUrl, lazPerfWasmUrl }
  *   2. Receives init → dynamic import(lazPerfUrl) → await createLazPerf()
  *   3. Sends { type: 'ready' }
- *   4. Receives { type: 'decode' } → fetch + WASM decode + quantize
+ *   4. Receives { type: 'decode', compressedBytes } → WASM decode + quantize
  *   5. Sends { type: 'decoded' } with Transferable buffers
+ *
+ * Phase 3 Track A — Step 3 (Option B fetch model):
+ *   The worker no longer self-fetches via HTTP Range request. The main
+ *   thread (StreamingEngine.startFetch) fetches the compressed chunk
+ *   bytes and transfers them to the worker via postMessage Transferable.
+ *   This enables coalescing (Step 4), cache integration (Step 5), and
+ *   ring-buffer-aware back-pressure (Step 6) — none of which are possible
+ *   when fetches are scattered across N workers.
  */
 
 // ─── WASM Module State ───────────────────────────────────────────────────────
@@ -43,9 +51,15 @@ self.onmessage = async (e: MessageEvent) => {
       // Dynamic import of the patched laz-perf-worker.js (ESM).
       // @vite-ignore tells Vite not to analyse/bundle this import —
       // it stays as a runtime fetch of the static file from public/.
+      //
+      // Track A Step 3 bugfix: previously this was hardcoded to a
+      // localhost dev URL, which broke any non-dev build. Now uses the
+      // URL passed via init, as the wiki [[laz-perf Worker Porting]]
+      // discovery prescribes (derive from window.location.origin on the
+      // main thread, pass to worker via init message).
       // eslint-disable-next-line @typescript-eslint/ban-ts-comment
       // @ts-ignore — dynamic URL import not in TS lib
-      const mod = await import(/* @vite-ignore */ 'http://localhost:5173/lib/laz-perf-worker.js')
+      const mod = await import(/* @vite-ignore */ lazPerfUrl)
       console.debug('[worker] import result:', {
         keys: Object.keys(mod),
         default: typeof mod.default,
@@ -89,20 +103,18 @@ self.onmessage = async (e: MessageEvent) => {
     return
   }
 
-  // ── Decode: fetch + decode + quantize ────────────────────────────────────
+  // ── Decode: copy bytes into heap + decode + quantize ──────────────────────
   if (msg.type === 'decode') {
-    await decodeChunk(msg)
+    decodeChunk(msg)
     return
   }
 }
 
 // ─── Chunk Decode ────────────────────────────────────────────────────────────
 
-async function decodeChunk(req: {
+function decodeChunk(req: {
   chunkIndex: number
-  url: string
-  offset: number
-  compressedSize: number
+  compressedBytes: ArrayBuffer    // Transferable — detached on main thread
   pointCount: number
   pointDataRecordFormat: number
   pointDataRecordLength: number
@@ -110,26 +122,19 @@ async function decodeChunk(req: {
   offsetX: number; offsetY: number; offsetZ: number
   globalMinZ: number
   globalMaxZ: number
-}): Promise<void> {
+}): void {
   try {
     if (!Module || !decoder) {
       throw new Error('Worker not initialised — decode called before init completed')
     }
 
-    // Step 1: Fetch compressed chunk bytes via HTTP Range request
-    const response = await fetch(req.url, {
-      headers: { Range: `bytes=${req.offset}-${req.offset + req.compressedSize - 1}` },
-      cache: 'no-store',
-      mode: 'cors',
-    })
+    // Step 1: Copy compressed bytes into WASM heap
+    //
+    // The bytes arrived as a Transferable ArrayBuffer — we now own them
+    // in the worker's address space. No fetch, no network — that all
+    // happens on the main thread now (Track A Step 3, Option B model).
+    const compressedBytes = new Uint8Array(req.compressedBytes)
 
-    if (response.status !== 206 && response.status !== 200) {
-      throw new Error(`Range request failed: HTTP ${response.status}`)
-    }
-
-    const compressedBytes = new Uint8Array(await response.arrayBuffer())
-
-    // Step 2: Copy compressed bytes into WASM heap
     if (compressedBytes.length > compressedAllocSize) {
       if (compressedPtr !== 0) Module._free(compressedPtr)
       compressedAllocSize = compressedBytes.length * 2
@@ -140,11 +145,11 @@ async function decodeChunk(req: {
     }
     Module.HEAPU8.set(compressedBytes, compressedPtr)
 
-    // Step 3: Open chunk decoder
+    // Step 2: Open chunk decoder
     // ChunkDecoder.open(pdrf, recordLength, compressedDataPointer)
     decoder.open(req.pointDataRecordFormat, req.pointDataRecordLength, compressedPtr)
 
-    // Step 4: Decode all points — first pass collects raw coords for bbox
+    // Step 3: Decode all points — first pass collects raw coords for bbox
     const rawX = new Float64Array(req.pointCount)
     const rawY = new Float64Array(req.pointCount)
     const rawZ = new Float64Array(req.pointCount)
@@ -173,13 +178,12 @@ async function decodeChunk(req: {
       if (wz < minZ) minZ = wz; if (wz > maxZ) maxZ = wz
     }
 
-    // Step 5: Quantize to Int16 per-chunk-local coords
+    // Step 4: Quantize to Int16 per-chunk-local coords
     // Int16 range [-32768, 32767] maps to [min, max] per axis
     // Dequantization: world = (q + 32768) / 65535 * range + min
     const rangeX = maxX - minX || 1  // guard against flat/degenerate chunks
     const rangeY = maxY - minY || 1
     const rangeZ = maxZ - minZ || 1
-    
 
     const positions = new Int16Array(req.pointCount * 3)
     const colors    = new Uint8Array(req.pointCount * 4)
@@ -198,7 +202,7 @@ async function decodeChunk(req: {
       colors[i * 4 + 3] = 255
     }
 
-    // Step 6: Transfer decoded buffers to main thread — zero-copy
+    // Step 5: Transfer decoded buffers to main thread — zero-copy
     self.postMessage(
       {
         type: 'decoded',

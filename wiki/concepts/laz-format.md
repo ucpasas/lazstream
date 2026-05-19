@@ -2,7 +2,7 @@
 title: LAZ Format
 type: concept
 status: active
-updated: 2026-05-10
+updated: 2026-05-16
 tags: [laz, las, header, pdrf, chunk-table, compression]
 ---
 
@@ -99,6 +99,8 @@ for (i = 1; i <= number_chunks; i++) {
 ```
 
 **Verified against:** USGS 3DEP Central Texas, 380 chunks, 797 compressed bytes → 380 uint32 delta values.
+
+The hand-port of the LASzip arithmetic decoder + integer compressor + model code took four rounds of debugging against Melbourne 2018 (7073 entries) to align with the canonical C++ semantics. See [[Chunk-Table Decoder Saga]] for the full diagnostic narrative. As of 2026-05-16 the port is production-correct: 7073 entries decode in ~3 ms with all values matching what the `laszip` CLI produces.
 
 ### Discovery 2: 4-byte point count prefix — fixed vs. variable chunks
 

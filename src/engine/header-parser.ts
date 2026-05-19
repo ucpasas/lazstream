@@ -29,6 +29,12 @@
  *   219–258 Offsets (X, Y, Z as float64)
  *   259–298 Max/min X, Y, Z (6 × float64)
  *   ...
+ *
+ * Phase 3 Track A — Step 2 (cancellation):
+ *   fetchAndParseLasHeader accepts an optional AbortSignal that is
+ *   passed straight to its internal fetchRange calls. When the signal
+ *   fires, fetches throw AbortError; the engine treats this as a
+ *   silent end to the cancelled load.
  */
 
 import type { LasHeader, LazVlr } from '../types/las.js'
@@ -221,15 +227,20 @@ function parseLazVlrData(
  * Top-level: fetch the LAS header and LAZ VLR from a URL.
  * Issues a single range request for the first 8KB (covers header + typical VLRs).
  * If VLRs extend beyond 8KB, falls back to a larger fetch.
+ *
+ * @param signal Optional AbortSignal — passed to both internal fetchRange calls.
  */
-export async function fetchAndParseLasHeader(url: string): Promise<{
+export async function fetchAndParseLasHeader(
+  url: string,
+  signal?: AbortSignal,
+): Promise<{
   header: LasHeader
   lazVlr: LazVlr
   buffer: ArrayBuffer
 }> {
   // First fetch: 8KB covers the public header (375 bytes) + most VLR sets
   const INITIAL_FETCH = 8192
-  let buffer = await fetchRange(url, 0, INITIAL_FETCH - 1)
+  let buffer = await fetchRange(url, 0, INITIAL_FETCH - 1, signal)
   let view = new DataView(buffer)
 
   const header = parseLasHeader(view)
@@ -237,7 +248,7 @@ export async function fetchAndParseLasHeader(url: string): Promise<{
   // Check if VLRs fit in our initial fetch
   // VLRs end at pointDataOffset; if that exceeds our buffer, fetch more
   if (header.pointDataOffset > INITIAL_FETCH) {
-    buffer = await fetchRange(url, 0, header.pointDataOffset - 1)
+    buffer = await fetchRange(url, 0, header.pointDataOffset - 1, signal)
     view = new DataView(buffer)
   }
 

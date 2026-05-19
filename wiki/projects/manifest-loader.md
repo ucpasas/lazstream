@@ -2,7 +2,7 @@
 title: Manifest Loader
 type: project
 status: active
-updated: 2026-05-10
+updated: 2026-05-16
 tags: [laz, header, chunk-table, parsing, url-validation]
 ---
 
@@ -90,6 +90,12 @@ fetchSeedPoints()              one raw point per chunk → SeedPoint[]
 - Only 2–3 range requests permitted during manifest phase (probe + header + chunk table).
 - All fetch calls must include `cache: 'no-store'` (COOP/COEP requirement — see [[HTTP/2 Range Requests]]).
 - No worker threads — manifest loading runs on the main thread (fast, no decode work).
+
+---
+
+## Phase 3 — chunk-table decoder production-correct
+
+The hand-port of `ArithmeticDecoder` + `ArithmeticModel` + `IntegerCompressor` was aligned with canonical LASzip C++ across four rounds of debugging against Melbourne 2018 (7073 entries). See [[Chunk-Table Decoder Saga]]. Phase 3 validation confirms 7073-entry chunk tables decode in ~3 ms with all chunk offsets matching ground truth (all 7073 seed points fall within the LAS header bbox).
 
 ---
 

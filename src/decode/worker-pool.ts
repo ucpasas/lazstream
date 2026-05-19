@@ -9,6 +9,18 @@
  *
  * Both the JS URL and WASM URL are passed to the worker via the init
  * message so it can load laz-perf and tell it where to find the WASM.
+ *
+ * Phase 3 Track A — Step 3 (Option B fetch model):
+ *   The pool no longer fetches. The engine fetches compressed bytes on
+ *   the main thread and hands them to requestDecode(chunkIndex, chunk,
+ *   compressedBytes). The pool transfers the bytes to a worker (or
+ *   queues if all workers are busy). configure() no longer takes a URL —
+ *   the pool has no use for it.
+ *
+ *   isKnown(chunkIndex) is new: returns true if a chunk is in any of
+ *   completed / inFlight / queue. The engine uses this to avoid both
+ *   re-fetching and re-queuing chunks already known to the pool —
+ *   isInFlight() alone misses the queue.
  */
 
 import type { LasHeader, LazVlr, ChunkTableEntry } from '../types/las.js'
@@ -39,6 +51,7 @@ export interface WorkerPoolEvents {
 interface PendingRequest {
   chunkIndex: number
   chunk: ChunkTableEntry
+  compressedBytes: ArrayBuffer    // Held until a worker is free; transferred on dispatch
 }
 
 interface WorkerState {
@@ -53,7 +66,6 @@ export class WorkerPool {
   private workers: WorkerState[] = []
   private queue: PendingRequest[] = []
   private events: WorkerPoolEvents
-  private url = ''
   private header: LasHeader | null = null
   private lazVlr: LazVlr | null = null
   private readyCount = 0
@@ -65,8 +77,12 @@ export class WorkerPool {
 
   constructor(events: WorkerPoolEvents = {}, workerCount?: number) {
     this.events = events
-    // Cap at 4 — HTTP/1.1 to R2 saturates at ~6 connections per origin
-    this.targetCount = workerCount ?? Math.min(4, Math.max(1, navigator.hardwareConcurrency - 1))
+    // Cap at 4 — kept for parity with HTTP/1.1 connection limit era.
+    // With Option B + HTTP/2 on data.lazstream.stream the network cap no
+    // longer applies; workers are pure CPU/WASM consumers now. Step 7
+    // (Phase 3 Track A) will retune this once the main-thread fetch loop
+    // is the load-bearing concurrency control.
+    this.targetCount = workerCount ?? Math.min(32, Math.max(1, navigator.hardwareConcurrency - 1))
     console.debug('[lazstream] WorkerPool: targeting', this.targetCount, 'workers', {
       hardwareConcurrency: navigator.hardwareConcurrency,
       explicitCount: workerCount,
@@ -140,8 +156,14 @@ export class WorkerPool {
     })
   }
 
-  configure(url: string, header: LasHeader, lazVlr: LazVlr): void {
-    this.url = url
+  /**
+   * Configure the pool with per-file metadata.
+   *
+   * Track A Step 3: URL no longer required — the pool doesn't fetch.
+   * Header gives PDRF, scale, offset, global Z range. LAZ VLR is held
+   * for parity with future selective-decode paths (PDRF 6+ layered).
+   */
+  configure(header: LasHeader, lazVlr: LazVlr): void {
     this.header = header
     this.lazVlr = lazVlr
     console.debug('[lazstream] WorkerPool configured:', {
@@ -149,18 +171,43 @@ export class WorkerPool {
     })
   }
 
-  requestDecode(chunkIndex: number, chunk: ChunkTableEntry): void {
+  /**
+   * Hand compressed bytes for one chunk to the pool. The bytes are
+   * transferred (not copied) to a worker — after this call, the
+   * compressedBytes ArrayBuffer is detached on the caller's side.
+   *
+   * Dedup: silently no-ops if the chunk is already completed or in
+   * flight (we don't re-queue). The engine's startFetch should already
+   * have filtered these via isKnown() before fetching, so this is a
+   * defensive net.
+   */
+  requestDecode(
+    chunkIndex: number,
+    chunk: ChunkTableEntry,
+    compressedBytes: ArrayBuffer,
+  ): void {
     if (this.disposed) return
     if (this.completed.has(chunkIndex) || this.inFlight.has(chunkIndex)) return
 
     const idle = this.workers.find(w => !w.busy)
     if (idle) {
-      this.dispatch(idle, chunkIndex, chunk)
+      this.dispatch(idle, chunkIndex, chunk, compressedBytes)
     } else {
       if (!this.queue.some(q => q.chunkIndex === chunkIndex)) {
-        this.queue.push({ chunkIndex, chunk })
+        this.queue.push({ chunkIndex, chunk, compressedBytes })
       }
     }
+  }
+
+  /**
+   * True if the pool already has this chunk anywhere in its pipeline —
+   * completed, in flight, or queued. The engine checks this before
+   * fetching to avoid wasted network I/O. (Phase 3 Track A — Step 3.)
+   */
+  isKnown(chunkIndex: number): boolean {
+    if (this.completed.has(chunkIndex)) return true
+    if (this.inFlight.has(chunkIndex)) return true
+    return this.queue.some(q => q.chunkIndex === chunkIndex)
   }
 
   clearQueue(): void { this.queue = [] }
@@ -178,7 +225,12 @@ export class WorkerPool {
 
   // ─── Internal ────────────────────────────────────────────────────────────
 
-  private dispatch(workerState: WorkerState, chunkIndex: number, chunk: ChunkTableEntry): void {
+  private dispatch(
+    workerState: WorkerState,
+    chunkIndex: number,
+    chunk: ChunkTableEntry,
+    compressedBytes: ArrayBuffer,
+  ): void {
     if (!this.header || !this.lazVlr) {
       console.error('[lazstream] dispatch called before configure() — skipping')
       return
@@ -188,12 +240,12 @@ export class WorkerPool {
     workerState.currentChunkIndex = chunkIndex
     this.inFlight.add(chunkIndex)
 
+    // Transfer the compressed bytes (not copy) — after postMessage the
+    // ArrayBuffer is detached on this side. Track A Step 3 fetch model.
     workerState.worker.postMessage({
       type: 'decode',
       chunkIndex,
-      url: this.url,
-      offset: chunk.offset,
-      compressedSize: chunk.compressedSize,
+      compressedBytes,
       pointCount: chunk.pointCount,
       pointDataRecordFormat: this.header.pointDataRecordFormat,
       pointDataRecordLength: this.header.pointDataRecordLength,
@@ -205,7 +257,7 @@ export class WorkerPool {
       offsetZ: this.header.offsetZ,
       globalMinZ: this.header.minZ,
       globalMaxZ: this.header.maxZ,
-    })
+    }, [compressedBytes])
   }
 
   private handleDecoded(workerState: WorkerState, msg: any): void {
@@ -241,8 +293,8 @@ export class WorkerPool {
 
   private dispatchNext(workerState: WorkerState): void {
     if (this.disposed || this.queue.length === 0) return
-    if (!this.url || !this.header || !this.lazVlr) return
+    if (!this.header || !this.lazVlr) return
     const next = this.queue.shift()!
-    this.dispatch(workerState, next.chunkIndex, next.chunk)
+    this.dispatch(workerState, next.chunkIndex, next.chunk, next.compressedBytes)
   }
 }

@@ -2,7 +2,7 @@
 title: Decoder Workers
 type: project
 status: active
-updated: 2026-05-13
+updated: 2026-05-18
 tags: [wasm, laz-perf, workers, decode, pdrf, quantization, transferable]
 ---
 
@@ -30,19 +30,19 @@ A pool of Web Workers, each hosting a laz-perf WASM instance. Workers **self-fet
 
 ## Architecture
 
-### Fetch model: Option A — workers self-fetch
+### Fetch model: Option B — main-thread fetches, workers decode only (Phase 3 Track A Step 3)
 
-Each worker receives a `decode` message containing `{ url, offset, compressedSize, ... }` and issues its own HTTP Range request. The alternative (main thread fetches, workers decode only) was deferred to Phase 3 when fetch coalescing becomes important.
+The engine fetches compressed chunk bytes on the main thread (via coalesced range requests) and hands them to `requestDecode(chunkIndex, chunk, compressedBytes)`. Workers receive only pre-fetched bytes — no network I/O in workers.
 
-**Why Option A for Phase 2:** Simpler wiring — no need to pipe byte arrays from main thread through postMessage. Workers already must make network calls; self-fetch avoids a round-trip. Revisit in Phase 3 for [[HTTP/2 Range Requests]] coalescing.
+**Why Option B:** Enables [[HTTP/2 Range Requests]] coalescing. To coalesce adjacent chunks into one range request, the fetcher must see all pending chunks at once — impossible if each worker fetches independently. Moving fetch to the main thread centralises the coalesce decision, decouples fetch concurrency from decode concurrency, and eliminates the HTTP/1.1 connection-limit constraint on worker count.
 
-### Worker count cap: 4
+### Worker count cap: 32
 
 ```typescript
-Math.min(4, Math.max(1, navigator.hardwareConcurrency - 1))
+Math.min(32, Math.max(1, navigator.hardwareConcurrency - 1))
 ```
 
-R2 serves over HTTP/1.1 which limits browsers to 6 concurrent connections per origin. 4 workers use 4/6 connections, leaving headroom for other requests. More workers queue behind the connection limit with no throughput benefit. Remove cap when HTTP/2 multiplexing is in place (Phase 3).
+Workers are now pure WASM decoders — no network I/O. The connection-limit rationale for capping at 4 no longer applies. 32 is a generous ceiling for CPU parallelism; in practice most machines saturate at `hardwareConcurrency - 1`.
 
 ### laz-perf loading: dynamic import from `public/lib/`
 
@@ -77,16 +77,18 @@ The `locateFile` override is mandatory — without it laz-perf resolves `.wasm` 
 ### Decode phase
 
 ```
-main thread → { type: 'decode', chunkIndex, url, offset, compressedSize, pointCount,
-                 pointDataRecordFormat, pointDataRecordLength, scaleX/Y/Z, offsetX/Y/Z }
-   worker → fetch(url, { headers: { Range }, cache: 'no-store' })
-   worker → Module.HEAPU8.set(compressedBytes, compressedPtr)
+main thread → { type: 'decode', chunkIndex, compressedBytes, pointCount,
+                 pointDataRecordFormat, pointDataRecordLength, scaleX/Y/Z, offsetX/Y/Z,
+                 globalMinZ, globalMaxZ }
+   worker → Module.HEAPU8.set(compressedBytes, compressedPtr)   // bytes already fetched
    worker → decoder.open(pdrf, recordLength, compressedPtr)
    worker → loop: decoder.getPoint(pointPtr) → read HEAP32 → apply scale+offset
-   worker → quantize XYZ → Int16, compute elevation color → Uint8
+   worker → quantize XYZ → Int16, compute elevation color → Uint8 (using globalMinZ/maxZ)
    worker → self.postMessage({ positions, colors, ... }, [positions.buffer, colors.buffer])
 main thread ← { type: 'decoded', chunkIndex, positions, colors, pointCount, min/max XYZ }
 ```
+
+`compressedBytes` is transferred (zero-copy Transferable) — the ArrayBuffer is detached on the main-thread side after `postMessage`.
 
 ---
 
@@ -111,7 +113,15 @@ The min/max bounding box for each axis is transmitted alongside the positions bu
 
 ### Deduplication
 
-`WorkerPool` tracks two sets: `inFlight` (currently decoding) and `completed` (done). `requestDecode()` is a no-op if a chunk is in either set — safe to call every frame from the render loop.
+`WorkerPool` tracks two sets: `inFlight` (currently decoding) and `completed` (done). `requestDecode()` is a no-op if a chunk is in either set.
+
+`isKnown(chunkIndex)` is a new Phase 3 Track A method — returns `true` if the chunk is anywhere in the pipeline: completed, in flight, or queued. The engine calls this before fetching to avoid wasted network I/O:
+
+```typescript
+if (this.workerPool.isKnown(item.chunkIndex)) continue
+```
+
+`isInFlight()` alone missed queued chunks, causing re-fetches for chunks already waiting for a worker slot.
 
 ### Queue
 
@@ -129,10 +139,10 @@ new WorkerPool({
 
 ### `configure()` call
 
-Before dispatching any chunks, the pool must be configured with the URL, header (for PDRF and scale/offset), and LAZ VLR:
+Before dispatching any chunks, the pool must be configured with the header (for PDRF, scale/offset, global Z range) and LAZ VLR. URL is no longer required — the pool doesn't fetch.
 
 ```typescript
-pool.configure(url, header, lazVlr)
+pool.configure(header, lazVlr)
 ```
 
 ---
@@ -157,6 +167,16 @@ The `prioritise(cameraWorldX, cameraWorldY, cameraWorldZ, maxResults, excludeDec
 | 6–10 | 1.4 | Standard (layered decode planned Phase 3) | Layered decode not yet used |
 
 Layered decode (XYZ-only mode skipping colour/classification layers) is planned for Phase 3 as a performance optimization.
+
+---
+
+## Worker count vs fetch concurrency (Phase 3 Track A)
+
+With Option B, worker count and fetch concurrency are independent:
+- **Worker count** = CPU/WASM decode parallelism. Cap: `Math.min(32, hardwareConcurrency - 1)`.
+- **Fetch concurrency** = `maxFetches = workerCount × 2` concurrent main-thread range requests.
+
+The engine's `fetching: Set<number>` tracks in-flight fetches. A chunk is claimed in `fetching` synchronously before any `await` in `updateCamera()`, preventing duplicate dispatches on concurrent frame ticks.
 
 ---
 
@@ -215,7 +235,6 @@ const t = (rawZ[i] - req.globalMinZ) / globalRangeZ
 
 - [ ] Layered decode (PDRF 6-10): implement XYZ-only skip for initial load pass (Phase 3)
 - [ ] Fork laz-perf on GitHub — currently using locally built copy; fork needed for reproducibility
-- [ ] Phase 3: move fetch to main thread for HTTP/2 coalescing (Option B fetch model)
 
 ---
 

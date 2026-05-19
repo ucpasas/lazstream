@@ -109,9 +109,114 @@ The shader indexes into it via `chunk.pointStrideOffset` (byte offset / 4, store
 
 ---
 
+## Configurable capacity + adapter-limit negotiation (2026-05-19)
+
+The ring buffer capacity is no longer hardcoded at 256 MB. `webgpu-context.ts` negotiates with the adapter's actual limits and exposes a `targetCapacityBytes` option.
+
+### Constants
+
+```typescript
+const DEFAULT_TARGET_RING_BUFFER_BYTES = 2 * 1024 * 1024 * 1024  // 2 GB
+const MIN_RING_BUFFER_BYTES             = 128 * 1024 * 1024      // 128 MB floor
+const MAX_RING_BUFFER_BYTES             = 4096 * 700_000          // ~2.87 GB ceiling
+```
+
+- **2 GB target** — comfortable on most discrete GPUs (NVIDIA RTX, AMD Radeon Pro typically advertise 2 GB+ in `adapter.limits.maxStorageBufferBindingSize`)
+- **128 MB floor** — below this, depth+color buffers at 4K resolution (~64 MB) leave too little room for point data
+- **~2.87 GB ceiling** — `MAX_SLOTS × slotBytes = 4096 × 700_000`. Beyond this the uniform pool runs out before the ring buffer. `webgpu-context.ts` clamps with a warning. To exceed, bump `MAX_SLOTS` in `webgpu-renderer.ts` first.
+
+### Negotiation pattern
+
+```typescript
+const adapterMaxStorage = adapter.limits.maxStorageBufferBindingSize
+const adapterMaxBuffer  = adapter.limits.maxBufferSize
+
+// Both must be raised — buffer is bound as storage AND is a buffer object.
+const requestedStorage = Math.min(adapterMaxStorage, target)
+const requestedBuffer  = Math.min(adapterMaxBuffer,  target)
+
+try {
+  device = await adapter.requestDevice({
+    requiredLimits: {
+      maxStorageBufferBindingSize: requestedStorage,
+      maxBufferSize:               requestedBuffer,
+    },
+  })
+} catch (err) {
+  console.warn('[webgpu] adapter rejected expanded storage limits — falling back to defaults:', err)
+  device = await adapter.requestDevice()
+}
+
+const ringBufferCapacity = Math.min(
+  device.limits.maxStorageBufferBindingSize,
+  device.limits.maxBufferSize,
+  target,
+)
+```
+
+### Override mechanisms
+
+**Via `WebGPURenderer.create()` options:**
+
+```typescript
+await WebGPURenderer.create(canvas, {
+  ringBufferCapacity: 1024 * 1024 * 1024,  // 1 GB explicit
+})
+```
+
+Flows through to `createWebGPUContext(canvas, { targetCapacityBytes: options.ringBufferCapacity })`.
+
+**Via URL parameter (no code change):**
+
+```
+?bufferMB=2048    → 2 GB
+?bufferMB=512     → 512 MB
+?bufferMB=2937    → ~2.87 GB (near ceiling)
+?bufferMB=4096    → clamped to ceiling with warning
+?bufferMB=64      → clamped up to 128 MB with warning
+```
+
+`main.ts` parses `URLSearchParams(location.search).get('bufferMB')`, converts to bytes, forwards to renderer.
+
+### Observed values
+
+| Setup | Adapter max | Granted | Slots | Points |
+|---|---|---|---|---|
+| RTX-class discrete GPU | 2048 MB | 2048 MB | ~2995 | ~150M |
+| Typical integrated | 256 MB | 256 MB | 374 | ~18.7M |
+| Default fallback | n/a | 128 MB | 187 | ~9.4M |
+
+### Diagnostic log
+
+`createWebGPUContext` always emits at startup:
+
+```
+[webgpu] negotiated context: {
+  adapterMaxStorageMB:        2048,
+  adapterMaxBufferMB:         2048,
+  deviceMaxStorageMB:         2048,
+  deviceMaxBufferMB:          2048,
+  ringBufferCapacityMB:       2048,
+  requestedTargetMB:          2048,
+}
+```
+
+`requestedTargetMB` vs `ringBufferCapacityMB` divergence indicates whether the adapter capped the request.
+
+### Caveats at high slot counts
+
+- **Per-frame CPU encoding cost** scales linearly with slot count. At ~3000 slots, the per-slot `setBindGroup + dispatchWorkgroups` loop takes ~15 ms — close to the 16.7 ms frame budget. Symptoms: `requestAnimationFrame handler took 72ms` violation warnings during slot churn.
+- **Deferred queue overflow** is more frequent. Default `MAX_DEFERRED_CHUNKS=64` was calibrated for 374-slot operation; at 3000 slots, fast camera movement can drop 250+ chunks. Bump to 256 for large buffers.
+- **Memory pressure**: 2 GB ring buffer + 512 MB IDB cache + ~150 MB workers + JS heap ≈ 3 GB+ total. Integrated GPUs or memory-constrained tabs may struggle.
+
+For higher buffer sizes without hitting these caveats, see Phase 5 indirect dispatch in [[Back-Pressure Invariants]].
+
+---
+
 ## See also
 
 - [[Renderer]] — owns the ring buffer; updates `lastRenderedFrame`
 - [[Decoder Workers]] — produces decoded buffers written into the ring
 - [[WebGPU Compute]] — binds the ring buffer as a compute shader input
 - [[Spatial Index]] — provides visible chunk set for eviction guard
+- [[Back-Pressure Invariants]] — invariants that keep the ring buffer from overflowing

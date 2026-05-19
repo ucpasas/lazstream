@@ -2,7 +2,7 @@
 title: Renderer
 type: project
 status: active
-updated: 2026-05-13
+updated: 2026-05-16
 tags: [three.js, webgpu, webgl, compute-shader, point-cloud, ring-buffer, seed-points, dequantization, webgpu-renderer, point-packing, dynamic-offset]
 ---
 
@@ -153,11 +153,20 @@ Seeds are packed via `packSeedsAsChunk()` and added as a pseudo-chunk (`chunkInd
 | FPS | ~76 |
 | WebGPU confirmed | `canvas.getContext('webgpu')` → `GPUCanvasContext` |
 
-### Known limitations entering Phase 3
+### Frustum extraction (Phase 3 Track C)
 
-- Melbourne 2018 (353M pts, 7000+ chunks): page unresponsive — `decodeAll()` / `updateCamera()` queues too many chunks before the main thread gets a tick. Requires Phase 3 frame-amortised decode budget + back-pressure.
-- R2 r2.dev is HTTP/1.1 only — seed TTFF dominated by round trips. HTTP/2 requires a custom Cloudflare domain.
-- No frustum culling at chunk level — all loaded chunks dispatched every frame regardless of visibility (Phase 3: rbush integration)
+`getFrustumWorldBBox3D()` projects the 8 NDC frustum corners through the cached `invViewProj` matrix to get world-space corner positions, then computes the AABB. Cached `Float32Array(8 * 3)` buffer reused each frame. `getFovY()` and `getCanvasHeight()` exposed for SSE calculations in [[Spatial Index]].
+
+### Ring buffer fragmentation at Melbourne scale
+
+At the 256 MB ring buffer's ~430-chunk capacity (50,000 points × 12 bytes = 600 KB per chunk), first-fit allocation begins refusing new chunks even when total free bytes are sufficient. Observed as `[webgpu] ring buffer can't fit chunk N (600000 B) — dropped` warnings cascading once the buffer hits ~430-chunk capacity with fragmented free space.
+
+GPU-side compaction was deferred to "Track B v2" in [[Ring Buffer GPU Memory]]; confirmed as needed for files of Melbourne scale. Workaround: reduce point budget or wait for Track A back-pressure to limit how many chunks reach the buffer simultaneously.
+
+### Known limitations entering Phase 3 Track A
+
+- Ring buffer fragmentation caps Melbourne rendering at ~447 decoded chunks (~22.35M points). Requires Track A back-pressure + Track B v2 compaction.
+- `data.lazstream.stream` now live with HTTP/2 — r2.dev no longer the bottleneck.
 - No WebGL fallback (Phase 5)
 - Device lost: logs only, no recovery (Phase 5)
 - Splat size fixed at 1×1 pixel (Phase 5)
@@ -177,7 +186,115 @@ Seeds are packed via `packSeedsAsChunk()` and added as a pseudo-chunk (`chunkInd
 - [ ] WebGL fallback factory `createRenderer(canvas)` — Phase 5
 - [ ] Device lost / context restored recovery — Phase 5
 - [ ] Point splat size attenuation — Phase 5
-- [ ] Frustum culling: connect to [[Spatial Index]] for whole-chunk rejection — Phase 3
+- [ ] Frustum culling: connected to [[Spatial Index]] in Phase 3 Track C via provider pattern
+
+---
+
+## Header-driven initial framing (2026-05-19)
+
+`loadSeedPoints` accepts an optional `LasHeader` parameter and uses its bbox as the authoritative source for camera framing, rather than deriving the bbox from the (sampled, possibly incomplete) seed point cloud.
+
+### Signature
+
+```typescript
+loadSeedPoints(seeds: SeedPoint[], header?: LasHeader): void
+```
+
+When `header` is provided, the renderer uses `header.minX/maxX/minY/maxY/minZ/maxZ` for scene centre, camera distance, and frustum AABB conversion. When omitted, falls back to seed-derived `packed.min` / `packed.range`.
+
+### Camera position constants
+
+```typescript
+const CAMERA_INITIAL_ELEVATION_DEG = 30   // above horizontal at load
+const CAMERA_INITIAL_DISTANCE_MULT = 1.2  // bbox diagonal × this = camera distance
+```
+
+Elevation guide:
+- 90° = straight-down map view
+- 60° = top-down, sees ground footprints clearly
+- 45° = 3/4 oblique aerial (balanced)
+- 30° = more horizontal, sees building façades and vertical structure (current default)
+- 0° = horizon view
+
+Camera placement (looking south at scene-local origin):
+
+```typescript
+const elevationRad = (CAMERA_INITIAL_ELEVATION_DEG * Math.PI) / 180
+const cosE = Math.cos(elevationRad)
+const sinE = Math.sin(elevationRad)
+this.camera.position.set(0, -dist * cosE, dist * sinE)
+this.controls.target.set(0, 0, 0)
+```
+
+This is a proper unit vector × distance, landing the camera at exactly `dist` along the configured elevation line. The previous code used the literal vector `(0, -0.6, 0.7)`, which works out to 49.4° elevation with a non-unit vector length (0.922 × requested distance).
+
+### Why header bbox over seed bbox
+
+The seed pseudo-chunk covers ~7000 points sampled from the file's chunks (one per chunk). For most files this approximates the full bbox, but:
+- Chunks at the file's spatial edge may extend further than their seed point suggests
+- The LAS header bbox is computed by the writer over every point — ground truth
+- All subsequent decode operations reference the world bbox from the header; using a different bbox for initial framing creates a slight discrepancy
+
+The seed pseudo-chunk's own AABB stays at `packed.min` / `packed.range` (seed-derived), since that's what the slot table sees. Framing and culling are independent concerns.
+
+---
+
+## Persistent seed overview (2026-05-19)
+
+`SEED_HIDE_THRESHOLD = Infinity`. The seed pseudo-chunk stays in the buffer permanently.
+
+### Why
+
+At small buffer sizes (374 slots for the original 256 MB), loaded chunks cover only a small fraction of the file's visible area. Without seeds: "patches of detail in a black void." With seeds: "patches of detail with an outline of where the rest of the file is." At large buffer sizes (3000+ slots) the value is smaller but the cost is also trivial.
+
+### Cost
+
+- One ring buffer slot occupied permanently (~700 KB)
+- One compute dispatch per frame for ~7000 points (~10 µs)
+- One additional cull test (negligible)
+
+### Cull interaction
+
+The seed slot's AABB spans the full file bbox. At any camera position looking at the file, the frustum intersects this AABB — seeds always pass the cull and are always touched each frame. This makes seeds permanently non-evictable by the LRU algorithm. See [[Back-Pressure Invariants]] for the deliberate design of this behaviour.
+
+### Reverting
+
+To hide seeds once N real chunks have landed, change `SEED_HIDE_THRESHOLD` to a finite number (e.g. `10`).
+
+---
+
+## WebGPUContext interface contract — bug retrospective (2026-05-19)
+
+A reference `webgpu-context.ts` written without consulting the renderer's actual field accesses used wrong names:
+- Wrote `format` → renderer reads `canvasFormat`
+- Omitted `canvas` field → renderer reads `ctx.canvas` for OrbitControls + resize observer
+
+Both presented as `undefined` at render-pipeline creation:
+
+```
+Uncaught TypeError: Failed to execute 'createRenderPipeline' on 'GPUDevice':
+Failed to read the 'format' property from 'GPUColorTargetState': Required member is undefined.
+```
+
+Mitigation: grep `ctx.` in the renderer before writing the producer, or ship the interface definition first and confirm against the consumer before implementing.
+
+The current `WebGPUContext` interface (correct):
+
+```typescript
+export interface WebGPUContext {
+  device:  GPUDevice
+  context: GPUCanvasContext
+  canvas:  HTMLCanvasElement
+  canvasFormat: GPUTextureFormat
+  ringBufferCapacity: number
+  limits: {
+    adapterMaxStorageBufferBindingSize: number
+    adapterMaxBufferSize:               number
+    deviceMaxStorageBufferBindingSize:  number
+    deviceMaxBufferSize:                number
+  }
+}
+```
 
 ---
 
@@ -185,6 +302,7 @@ Seeds are packed via `packSeedsAsChunk()` and added as a pseudo-chunk (`chunkInd
 
 - [[Decoder Workers]] — Phase 2 source of point buffers
 - [[WebGPU Compute]] — atomicMin depth shader design
-- [[Ring Buffer GPU Memory]] — GPU memory management
+- [[Ring Buffer GPU Memory]] — GPU memory management, configurable capacity
 - [[Spatial Index]] — frustum culling input
 - [[LidarScout Chunk-Seed]] — Phase 1 fast overview; Phase 2 seed layer replaced per chunk
+- [[Back-Pressure Invariants]] — deferred queue, seed-slot eviction invariant

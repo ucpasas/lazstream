@@ -2,7 +2,7 @@
 title: LidarScout Chunk-Seed
 type: concept
 status: active
-updated: 2026-05-10
+updated: 2026-05-16
 tags: [lidarscout, overview, seeding, sparse-sampling, instant-preview]
 ---
 
@@ -28,6 +28,19 @@ Large LAZ files (10–100 GB) take minutes to fully stream and decode. Users nee
 4. Render as a sparse `Points` object — no laz-perf decoding needed.
 
 For fixed-size chunks (`lazVlr.chunkSize > 0`, the PDAL default), the seed point starts at exactly `chunkOffset + 0`. For variable-size chunks (`chunkSize === 0`, COPC), there is a 4-byte point count prefix so the seed starts at `chunkOffset + 4`. See [[LAZ Format]] Discovery 2.
+
+---
+
+## Melbourne 2018 validation (7073 chunks, HTTP/2 custom domain)
+
+| Metric | Value |
+|--------|-------|
+| Seed points fetched | 7073 |
+| Valid seeds rendered | 7073 / 7073 (all in bounds) |
+| Fetch time | ~5 s (HTTP/2 multiplexed) |
+| Render time | < 10 ms |
+
+All 7073 seed coordinates fall within the LAS header bbox, confirming the chunk-table decoder produces correct chunk offsets at multi-GB scale. See [[Chunk-Table Decoder Saga]] for the four-round debugging that made this possible.
 
 ---
 
