@@ -2,8 +2,8 @@
 title: WebGPU Compute
 type: concept
 status: active
-updated: 2026-05-13
-tags: [webgpu, compute-shader, wgsl, depth, atomicmin, schutz, storage-buffer, dynamic-offset]
+updated: 2026-05-20
+tags: [webgpu, compute-shader, wgsl, depth, atomicmin, schutz, storage-buffer, 2d-dispatch]
 ---
 
 # WebGPU Compute
@@ -44,10 +44,13 @@ The actual implementation uses a **storage buffer** (`array<atomic<u32>>`) rathe
 | Binding | Type | Contents |
 |---------|------|----------|
 | 0 | `uniform` | `CameraUniform` — viewProj mat4, viewportSize vec2, sceneCenter vec3 |
-| 1 | `uniform` (dynamic offset) | `ChunkUniform` — minXYZ, pointCount, rangeXYZ, pointStrideOffset |
+| 1 | `storage, read` | `ChunkUniform` array — minXYZ, pointCount, rangeXYZ, pointStrideOffset × MAX_SLOTS |
 | 2 | `storage, read` | Ring buffer — packed point data (`array<u32>`) |
 | 3 | `storage, read_write` | Depth buffer — `array<atomic<u32>>`, one u32 per pixel |
 | 4 | `storage, read_write` | Color buffer — `array<u32>`, one u32 per pixel |
+| 5 | `storage, read` | Visible slot list — `array<u32>` of uniformIdx values, one per visible slot this frame |
+
+Binding 1 was previously `uniform` with dynamic offset (256 B stride). Changed to `storage, read` array (32 B stride = actual struct size) as part of the 2D mega-dispatch refactor. Buffer size: MAX_SLOTS × 32 B = 128 KB (was 1 MB).
 
 ### Per-point pipeline
 
@@ -60,9 +63,17 @@ The actual implementation uses a **storage buffer** (`array<atomic<u32>>`) rathe
 7. `atomicMin(&depthBuffer[pixelIdx], bitcast<u32>(ndc.z))`
 8. If we won (`depthBits < prev`): write color non-atomically. Race is benign.
 
-### Dynamic offset dispatch
+### 2D mega-dispatch (2026-05-20)
 
-One `setBindGroup(..., [uniformIdx * chunkUniformStride])` + `dispatchWorkgroups(ceil(pointCount / 128))` per slot per frame. Avoids recreating bind groups between chunks.
+One `setBindGroup` + one `dispatchWorkgroups(maxWG, visibleCount, 1)` per frame, regardless of slot count.
+
+- `gid.y` = index into `visibleSlots[]` — identifies which chunk this workgroup row belongs to
+- `gid.x` = point index within the chunk (0 to `maxWG × 128 − 1`)
+- Workgroups where `gid.x >= chunk.pointCount` early-return (same as the last partial workgroup in the old approach)
+
+CPU builds `visibleSlots[]` during the frustum cull loop (same AABB test as before), then calls `writeBuffer` once to upload it. `maxWG` is `ceil(maxPointCount / 128)` where `maxPointCount` is the actual max across visible slots this frame — dispatch is tight, not padded.
+
+**Previous approach (removed):** One `setBindGroup(..., [uniformIdx × 256])` + `dispatchWorkgroups(ceil(pointCount / 128))` per slot. This was O(N) CPU encoder calls per frame; at 3000+ slots the encoding cost reached ~15 ms alone.
 
 ### Why IEEE 754 bitcast works for depth comparison
 

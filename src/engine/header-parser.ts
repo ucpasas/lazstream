@@ -173,7 +173,7 @@ export function parseLazVlr(buffer: ArrayBuffer, lasHeader: LasHeader): LazVlr {
     const dataOffset = offset + 54
 
     if (userId === LAZ_USER_ID && recordId === LAZ_RECORD_ID) {
-      return parseLazVlrData(view, dataOffset, lasHeader.pointDataRecordFormat)
+      return parseLazVlrData(view, dataOffset, lasHeader.pointDataRecordFormat, lasHeader.pointDataRecordLength)
     }
 
     offset = dataOffset + recordLength
@@ -205,19 +205,37 @@ export function parseLazVlr(buffer: ArrayBuffer, lasHeader: LasHeader): LazVlr {
 function parseLazVlrData(
   view: DataView,
   dataOffset: number,
-  pdrf: LasHeader['pointDataRecordFormat']
+  pdrf: LasHeader['pointDataRecordFormat'],
+  recordLength: number,
 ): LazVlr {
   const compressor = view.getUint16(dataOffset + 0, true)
   const chunkSize = view.getUint32(dataOffset + 12, true)
 
-  // LAZ 1.4 layered compressor = 3
-  // Applies to PDRF 6-10 with compressor type LAYERED_CHUNKED
-  const isLayered = compressor === 3 && pdrf >= 6
+  // Compressor 3 (LAYERED_CHUNKED) is only defined for PDRF 6-10.
+  // Some writers store only the LAZ compression flag (0x80) in byte 104,
+  // leaving the PDRF bits as 0. Detect this and derive the real PDRF from
+  // the record length (30 = PDRF 6, 36 = PDRF 7, 38 = PDRF 8, etc.).
+  let effectivePdrf = pdrf
+  if (compressor === 3 && pdrf === 0) {
+    const derived: Record<number, LasHeader['pointDataRecordFormat']> = {
+      30: 6, 36: 7, 38: 8, 59: 9, 67: 10,
+    }
+    effectivePdrf = derived[recordLength] ?? 6
+    console.warn(
+      `[header] PDRF byte reads as 0 for layered compressor — ` +
+      `derived PDRF ${effectivePdrf} from record length ${recordLength}`
+    )
+  }
+
+  // isLayered: compressor 3 = LAYERED_CHUNKED, which by definition requires
+  // PDRF 6-10. Do not gate on effectivePdrf here — the compressor field is
+  // the authoritative signal.
+  const isLayered = compressor === 3
 
   return {
     compressor,
     chunkSize: chunkSize === 0xFFFFFFFF ? 0 : chunkSize, // 0 = variable
-    pointDataRecordFormat: pdrf,
+    pointDataRecordFormat: effectivePdrf,
     numItems: view.getUint16(dataOffset + 32, true),
     isLayered,
   }
@@ -253,6 +271,12 @@ export async function fetchAndParseLasHeader(
   }
 
   const lazVlr = parseLazVlr(buffer, header)
+
+  // If parseLazVlrData corrected the PDRF (e.g., writer stored only the
+  // compression flag at byte 104), keep the header consistent.
+  if (lazVlr.pointDataRecordFormat !== header.pointDataRecordFormat) {
+    header.pointDataRecordFormat = lazVlr.pointDataRecordFormat
+  }
 
   return { header, lazVlr, buffer }
 }

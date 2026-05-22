@@ -40,6 +40,7 @@ export interface DecodedChunk {
   pointCount: number
   minX: number; minY: number; minZ: number
   maxX: number; maxY: number; maxZ: number
+  decodeMs: number
 }
 
 export interface WorkerPoolEvents {
@@ -77,12 +78,10 @@ export class WorkerPool {
 
   constructor(events: WorkerPoolEvents = {}, workerCount?: number) {
     this.events = events
-    // Cap at 4 — kept for parity with HTTP/1.1 connection limit era.
-    // With Option B + HTTP/2 on data.lazstream.stream the network cap no
-    // longer applies; workers are pure CPU/WASM consumers now. Step 7
-    // (Phase 3 Track A) will retune this once the main-thread fetch loop
-    // is the load-bearing concurrency control.
-    this.targetCount = workerCount ?? Math.min(32, Math.max(1, navigator.hardwareConcurrency - 1))
+    // Workers are pure CPU/WASM consumers (Option B fetch model — main thread fetches).
+    // Defaults to hardwareConcurrency - 1, capped at 100.
+    // Fetch concurrency is controlled independently by StreamingEngine.maxFetches.
+    this.targetCount = workerCount ?? Math.min(100, Math.max(1, navigator.hardwareConcurrency - 1))
     console.debug('[lazstream] WorkerPool: targeting', this.targetCount, 'workers', {
       hardwareConcurrency: navigator.hardwareConcurrency,
       explicitCount: workerCount,
@@ -140,6 +139,15 @@ export class WorkerPool {
             filename: err.filename,
             lineno: err.lineno,
           })
+          // Clean up in-flight tracking. Do NOT call dispatchNext — if this
+          // fired from a WASM abort (e.g. unsupported layered LAZ format), the
+          // WASM module is in an indeterminate state and sending another decode
+          // request would trigger a crash loop. The worker sits idle; the engine
+          // back-pressure and deferred queue drain work around the lost capacity.
+          if (state.currentChunkIndex !== null) {
+            this.inFlight.delete(state.currentChunkIndex)
+            this.events.onWorkerError?.(state.currentChunkIndex, err.message ?? 'uncaught worker error')
+          }
           state.busy = false
           state.currentChunkIndex = null
         }
@@ -212,6 +220,9 @@ export class WorkerPool {
 
   clearQueue(): void { this.queue = [] }
   isDecoded(chunkIndex: number): boolean { return this.completed.has(chunkIndex) }
+  /** Remove a chunk from the completed set so it can be re-decoded after
+   *  proactive GPU eviction. Paired with ChunkPrioritiser.removeDecoded(). */
+  markEvicted(chunkIndex: number): void { this.completed.delete(chunkIndex) }
   get activeCount(): number { return this.inFlight.size }
   get queueLength(): number { return this.queue.length }
 
@@ -274,6 +285,7 @@ export class WorkerPool {
       pointCount: msg.pointCount,
       minX: msg.minX, minY: msg.minY, minZ: msg.minZ,
       maxX: msg.maxX, maxY: msg.maxY, maxZ: msg.maxZ,
+      decodeMs: msg.decodeMs ?? 0,
     })
 
     this.dispatchNext(workerState)

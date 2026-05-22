@@ -93,7 +93,7 @@ In Phase 2 the seed requests will be coalesced: since chunk offsets are known fr
 ## Open questions
 
 - [ ] Should seed points be cached in [[Chunk Caching]]? (Very cheap to re-fetch; probably not worth the write overhead.)
-- [ ] LAZ 1.2/1.3 seed offset: `seedByteOffset = 0` is correct in theory (they predate variable chunks) but has not been tested against a real LAZ 1.2/1.3 file.
+- [x] LAZ 1.2/1.3 seed offset: `seedByteOffset = 0` **verified 2026-05-22** against `cloud-garden.laz` (terrestrial scan, PDRF 2 RGB). Seeds and RGB decode correct across all 1952 chunks.
 
 ---
 

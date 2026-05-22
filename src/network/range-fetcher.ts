@@ -21,14 +21,16 @@ export class NetworkError extends Error {
 export async function fetchRange(
   url: string,
   start: number,
-  end: number
+  end: number,
+  signal?: AbortSignal,
 ): Promise<ArrayBuffer> {
   const response = await fetch(url, {
     headers: {
       // Inclusive range: bytes=start-end fetches end-start+1 bytes
       Range: `bytes=${start}-${end}`,
     },
-    cache: 'no-store', 
+    cache: 'no-store',
+    signal,
   })
 
   if (response.status !== 206 && response.status !== 200) {
@@ -107,12 +109,12 @@ export async function fetchTail(
  * but do not include Accept-Ranges in HEAD responses. The only reliable
  * way to confirm range support is to actually attempt one.
  */
-export async function probeUrl(url: string): Promise<{
+export async function probeUrl(url: string, signal?: AbortSignal): Promise<{
   fileSize: number
   supportsRange: boolean
 }> {
   // Step 1: HEAD request for file size
-  const headResponse = await fetch(url, { method: 'HEAD', cache: 'no-store' })
+  const headResponse = await fetch(url, { method: 'HEAD', cache: 'no-store', signal })
 
   if (!headResponse.ok) {
     throw new NetworkError(
@@ -137,6 +139,7 @@ export async function probeUrl(url: string): Promise<{
     const rangeResponse = await fetch(url, {
       headers: { Range: 'bytes=0-0' },
       cache: 'no-store',
+      signal,
     })
 
     if (rangeResponse.status === 206) {

@@ -185,8 +185,8 @@ GPU-side compaction was deferred to "Track B v2" in [[Ring Buffer GPU Memory]]; 
 
 - [ ] WebGL fallback factory `createRenderer(canvas)` — Phase 5
 - [ ] Device lost / context restored recovery — Phase 5
-- [ ] Point splat size attenuation — Phase 5
-- [ ] Frustum culling: connected to [[Spatial Index]] in Phase 3 Track C via provider pattern
+- [ ] Point splat size **attenuation** (distance-based auto-scaling) — Phase 5. Fixed configurable splat radius (`splatRadius`, default 2 = 3×3 px) is shipped via `?splatRadius=N`; true attenuation (zoom-dependent) is deferred.
+- [x] Frustum culling connected to [[Spatial Index]] in Phase 3 Track C via provider pattern — **done**: `setFrustumProvider()` registered in `main.ts`; engine pulls frustum AABB each frame without importing Three.js.
 
 ---
 
@@ -295,6 +295,153 @@ export interface WebGPUContext {
   }
 }
 ```
+
+---
+
+## Proactive eviction (2026-05-20)
+
+Slots are evicted eagerly when invisible, not only on demand.
+
+### Motivation
+
+Before proactive eviction, invisible slots sat in the ring buffer indefinitely. The only time a slot was freed was when `allocate()` needed space and called `findLRUEvictable()`. A camera orbit that revealed new chunks while keeping old ones technically "loaded" would hit a full buffer with no evictable slots — all stale slots were still occupied.
+
+### Implementation
+
+`evictInvisibleSlots()` is called **every frame** after the cull+touch loop, before `flushDeferredChunks()`:
+
+```typescript
+private evictInvisibleSlots(): void {
+  const threshold = this.currentFrame - EVICT_GRACE_FRAMES
+  const toEvict: Array<{ chunkIndex: number; wasRendered: boolean }> = []
+  for (const slot of this.slots.getSlots()) {
+    if (slot.chunkIndex === SEED_PSEUDO_CHUNK_INDEX) continue
+    if (slot.lastRenderedFrame < threshold) {
+      toEvict.push({ chunkIndex: slot.chunkIndex, wasRendered: slot.everRendered })
+    }
+  }
+  for (const { chunkIndex, wasRendered } of toEvict) {
+    this.releaseSlot(chunkIndex)
+    if (wasRendered) this.chunkEvictedCallback?.(chunkIndex)
+  }
+}
+```
+
+### EVICT_GRACE_FRAMES
+
+```typescript
+const EVICT_GRACE_FRAMES = 5  // ~83 ms at 60 fps
+```
+
+Grace period prevents churn during fast pans: a slot that briefly leaves the frustum during a pan but re-enters within 83 ms is not evicted.
+
+### `everRendered` guard — phantom chunk fix
+
+"Phantom chunks" pass the engine's conservative AABB frustum dispatch but fail the renderer's exact 6-plane cull — `touch()` is never called for them, so `everRendered` stays `false`. Without the guard, they would: evict after grace period → `chunkEvictedCallback` re-queues → re-decode → same failure → infinite oscillation (observed as slot count toggling 35↔36).
+
+Fix: only call `chunkEvictedCallback` when `slot.everRendered === true`. Phantom chunks are released silently — no re-queue.
+
+### Callback wiring
+
+```
+renderer.setChunkEvictedCallback(chunkIndex => engine.onChunkEvictedFromGPU(chunkIndex))
+
+engine.onChunkEvictedFromGPU(chunkIndex):
+  prioritiser.removeDecoded(chunkIndex)   // re-enables for ChunkPrioritiser
+  workerPool.markEvicted(chunkIndex)      // clears workerPool.completed
+```
+
+All three removals are required — missing any one permanently orphans the chunk.
+
+### Deferred queue overflow also notifies engine
+
+A chunk dropped from `deferredChunks` (capacity overflow) stays in `prioritiser.decoded` and `workerPool.completed` — never in a GPU slot — so GPU eviction never reaches it. `flushDeferredChunks()` calls `chunkEvictedCallback` on any chunk it drops from the queue, same as GPU eviction.
+
+---
+
+## 2D mega-dispatch (2026-05-20)
+
+Replaced the O(N) per-slot CPU encoder loop with a single 2D GPU dispatch.
+
+### Before: O(N) encoder calls
+
+```typescript
+for (const slot of this.slots.getSlots()) {
+  ... frustum cull ...
+  pass.setBindGroup(0, depthBindGroup, [uniformIdx * 256])
+  pass.dispatchWorkgroups(ceil(pointCount / 128))
+  slots.touch(slot.chunkIndex, frame)
+}
+// → N × 2 CPU encoder calls per frame
+```
+
+### After: O(1) encoder calls
+
+```typescript
+// CPU cull loop — same AABB test, builds a list instead of dispatching
+let visibleCount = 0, maxPointCount = 0
+for (const slot of this.slots.getSlots()) {
+  ... frustum cull ...
+  visibleSlotListScratch[visibleCount++] = uniformIdx
+  maxPointCount = Math.max(maxPointCount, slot.pointCount)
+  slots.touch(slot.chunkIndex, frame)
+}
+if (visibleCount > 0) {
+  device.queue.writeBuffer(visibleSlotListBuf, 0, visibleSlotListScratch, 0, visibleCount * 4)
+  const maxWG = Math.ceil(maxPointCount / COMPUTE_WORKGROUP_SIZE)
+  pass.setBindGroup(0, depthBindGroup)              // 1 call
+  pass.dispatchWorkgroups(maxWG, visibleCount, 1)   // 1 call
+}
+// → 2 CPU encoder calls regardless of slot count
+```
+
+### Shader changes
+
+`gid.y` = slot index in the visible list; `gid.x` = point index within the slot:
+
+```wgsl
+@group(0) @binding(1) var<storage, read> chunks:       array<ChunkUniform>;
+@group(0) @binding(5) var<storage, read> visibleSlots: array<u32>;
+
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let chunk    = chunks[visibleSlots[gid.y]];
+    let pointIdx = gid.x;
+    if (pointIdx >= chunk.pointCount) { return; }
+    // ... rest unchanged
+}
+```
+
+### Binding changes
+
+| Binding | Before | After |
+|---------|--------|-------|
+| 1 | `uniform, hasDynamicOffset` (256 B stride) | `storage, read` array (32 B stride) |
+| 5 | — | `storage, read` — visible slot list (`array<u32>`) |
+
+`chunkUniform` buffer size drops from `MAX_SLOTS × 256 = 1 MB` to `MAX_SLOTS × 32 = 128 KB`.
+
+### New buffers
+
+```typescript
+visibleSlotListBuf     = createBuffer(MAX_SLOTS * 4, STORAGE | COPY_DST)
+visibleSlotListScratch = new Uint32Array(MAX_SLOTS)   // CPU scratch, reused each frame
+```
+
+---
+
+## Visual rendering tiers (2026-05-20)
+
+Three distinct visual states exist at any camera position:
+
+| Tier | Source | Appearance |
+|------|--------|------------|
+| **Background** | No GPU data | Black |
+| **Seed layer** | Seed pseudo-chunk (chunkIndex = -1), always resident | Sparse scattered dots across full file extent |
+| **Decoded chunks** | Fully decoded LAZ chunks in ring buffer | Dense or solid, depending on camera distance |
+
+The "solid" vs "dotty" appearance of decoded chunks is **not a separate mode** — it is a consequence of the ratio of points to projected pixels at the current camera distance. At a medium distance (points < pixels in the projected chunk area), individual points are visible with gaps. At close range (points ≥ pixels), every pixel gets a point and the chunk appears solid. True per-distance LOD would require pre-tiled data (COPC octree); raw LAZ has binary LOD only (seed or full chunk).
+
+The seed layer is always composited underneath decoded chunks via the `atomicMin` depth buffer — seed points show through any gap not covered by a decoded chunk's points.
 
 ---
 

@@ -51,8 +51,8 @@ export interface LazVlr {
   // Compressor type
   compressor: number
 
-  // Chunk size (default 50000 points)
-  // If chunkSize === 0xFFFFFFFF → variable chunk size (LAZ 1.4 adaptive)
+  // Chunk size in points (default 50000).
+  // 0 = variable chunk size (raw VLR value is 0xFFFFFFFF, normalized to 0 by parser).
   chunkSize: number
 
   // Point data record format (mirrors LAS header)

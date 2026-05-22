@@ -1,9 +1,10 @@
 // points-depth.wgsl
-// One compute dispatch per chunk. Each invocation processes one point.
+// Single 2D dispatch covers all visible chunks in one GPU call.
 //
-// Per-chunk uniform (`ChunkUniform`) is bound with a dynamic offset, so the
-// host updates a single uniform buffer once and selects the slot per dispatch
-// via setBindGroup(..., [offset]).
+// gid.y = index into visibleSlots[], which maps to a uniformIdx into
+// the chunks[] storage array. gid.x = point index within that chunk.
+// The host builds visibleSlots on CPU (frustum cull), writes it via
+// writeBuffer, then calls dispatchWorkgroups(maxWG, visibleCount, 1).
 //
 // For each point:
 //  1. Unpack Int16 quantized x,y,z (sign-extended from u32 halves)
@@ -16,11 +17,11 @@
 //  7. If we won the race, write color non-atomically. Race tolerated.
 
 struct CameraUniform {
-    viewProj: mat4x4<f32>,
+    viewProj:     mat4x4<f32>,
     viewportSize: vec2<f32>,
-    _pad0: vec2<f32>,
-    sceneCenter: vec3<f32>,
-    _pad1: f32,
+    _pad0:        vec2<f32>,
+    sceneCenter:  vec3<f32>,
+    splatRadius:  f32,
 };
 
 struct ChunkUniform {
@@ -30,11 +31,12 @@ struct ChunkUniform {
     pointStrideOffset: u32,   // offset (in u32s) into `points` where this chunk starts
 };
 
-@group(0) @binding(0) var<uniform> camera: CameraUniform;
-@group(0) @binding(1) var<uniform> chunk:  ChunkUniform;
-@group(0) @binding(2) var<storage, read> points: array<u32>;
+@group(0) @binding(0) var<uniform>            camera:       CameraUniform;
+@group(0) @binding(1) var<storage, read>      chunks:       array<ChunkUniform>;
+@group(0) @binding(2) var<storage, read>      points:       array<u32>;
 @group(0) @binding(3) var<storage, read_write> depthBuffer: array<atomic<u32>>;
 @group(0) @binding(4) var<storage, read_write> colorBuffer: array<u32>;
+@group(0) @binding(5) var<storage, read>      visibleSlots: array<u32>;
 
 fn unpackI16(packed: u32, half: u32) -> i32 {
     let raw = (packed >> (half * 16u)) & 0xFFFFu;
@@ -46,6 +48,7 @@ fn unpackI16(packed: u32, half: u32) -> i32 {
 
 @compute @workgroup_size(128)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let chunk    = chunks[visibleSlots[gid.y]];
     let pointIdx = gid.x;
     if (pointIdx >= chunk.pointCount) { return; }
 
@@ -79,10 +82,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (px >= u32(viewportW)) { return; }
     if (py >= u32(viewportH)) { return; }
 
-    let pixelIdx = py * u32(viewportW) + px;
     let depthBits = bitcast<u32>(ndc.z);
-    let prev = atomicMin(&depthBuffer[pixelIdx], depthBits);
-    if (depthBits < prev) {
-        colorBuffer[pixelIdx] = rgba;
+    let radius = i32(camera.splatRadius) - 1;
+    let vpW = i32(viewportW);
+    let vpH = i32(viewportH);
+    for (var dy: i32 = -radius; dy <= radius; dy++) {
+        for (var dx: i32 = -radius; dx <= radius; dx++) {
+            let sx = i32(px) + dx;
+            let sy = i32(py) + dy;
+            if (sx < 0 || sy < 0 || sx >= vpW || sy >= vpH) { continue; }
+            let idx = u32(sy) * u32(vpW) + u32(sx);
+            let prev = atomicMin(&depthBuffer[idx], depthBits);
+            if (depthBits < prev) {
+                colorBuffer[idx] = rgba;
+            }
+        }
     }
 }

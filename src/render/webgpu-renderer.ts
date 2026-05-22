@@ -36,7 +36,7 @@ import resolveShaderSrc from './shaders/resolve-edl.wgsl?raw'
 
 import { createWebGPUContext, type WebGPUContext } from './webgpu-context'
 export { WebGPUUnsupportedError } from './webgpu-context'
-import { RingBufferAllocator, type Slot } from './ring-buffer'
+import { RingBufferAllocator } from './ring-buffer'
 import {
   BYTES_PER_POINT,
   packChunk,
@@ -50,7 +50,10 @@ import type { LasHeader } from '../types/las.js'
 // --- Constants ---------------------------------------------------------------
 
 const SEED_PSEUDO_CHUNK_INDEX = -1
-const SEED_HIDE_THRESHOLD     = Infinity      // keep seeds visible always — they provide the file-wide overview outline at every zoom level, useful when the ring buffer holds only a fraction of the file's chunks. Cost is trivial (one extra slot, ~7000 points per frame). Set to a finite number (e.g. 10) to hide seeds once N real chunks have landed.
+const SEED_HIDE_THRESHOLD     = Infinity
+/** Frames a slot must be invisible before proactive eviction.
+ *  At 60 fps, 5 frames ≈ 83 ms — survives fast pans without excessive churn. */
+const EVICT_GRACE_FRAMES      = 5      // keep seeds visible always — they provide the file-wide overview outline at every zoom level, useful when the ring buffer holds only a fraction of the file's chunks. Cost is trivial (one extra slot, ~7000 points per frame). Set to a finite number (e.g. 10) to hide seeds once N real chunks have landed.
 const MAX_SLOTS               = 4096          // upper bound on simultaneous chunks
 const COMPUTE_WORKGROUP_SIZE  = 128
 const CLEAR_WORKGROUP_SIZE    = 256
@@ -114,11 +117,12 @@ export class WebGPURenderer {
   private readonly resolveBindLayout: GPUBindGroupLayout
 
   // Buffers — static (created once)
-  private readonly ringBuffer:      GPUBuffer  // packed points, sized to ringBufferCapacity
-  private readonly cameraUniform:   GPUBuffer  // CAMERA_UNIFORM_BYTES
-  private readonly chunkUniform:    GPUBuffer  // MAX_SLOTS * chunkUniformStride
-  private readonly viewportUniform: GPUBuffer  // VIEWPORT_UNIFORM_BYTES
-  private readonly chunkUniformStride: number  // 256 typically (device alignment)
+  private readonly ringBuffer:         GPUBuffer  // packed points, sized to ringBufferCapacity
+  private readonly cameraUniform:      GPUBuffer  // CAMERA_UNIFORM_BYTES
+  private readonly chunkUniform:       GPUBuffer  // MAX_SLOTS * CHUNK_UNIFORM_BYTES (storage array)
+  private readonly viewportUniform:    GPUBuffer  // VIEWPORT_UNIFORM_BYTES
+  private readonly visibleSlotListBuf: GPUBuffer  // MAX_SLOTS * 4 (u32 uniformIdx per visible slot)
+  private readonly visibleSlotListScratch: Uint32Array  // CPU-side visible list, rebuilt each frame
 
   // Buffers — viewport-dependent (recreated on resize)
   private depthBuffer!: GPUBuffer
@@ -150,11 +154,12 @@ export class WebGPURenderer {
    * prioritiser has already marked the chunk as "decoded" so it can't be
    * re-dispatched in this session.
    *
-   * Bounded — MAX_DEFERRED_CHUNKS caps memory at ~38 MB (64 × ~600 KB). Beyond
+   * Bounded — MAX_DEFERRED_CHUNKS caps memory at ~153 MB (256 × ~600 KB). Beyond
    * that, oldest chunks get dropped (the dispatch flow is faster than the
    * buffer can absorb).
    */
-  private readonly MAX_DEFERRED_CHUNKS = 64
+  private readonly MAX_DEFERRED_CHUNKS = 256
+  private splatRadius = 2
   private deferredChunks: Array<{
     chunkIndex: number
     packed: Uint32Array
@@ -170,8 +175,16 @@ export class WebGPURenderer {
   private readonly sceneCenter = { x: 0, y: 0, z: 0 }
   private cameraDirty = true
 
+  // Pipeline timing accumulators — logged every TIMING_LOG_INTERVAL chunks
+  private readonly TIMING_LOG_INTERVAL = 25
+  private timingDecodeTotal = 0
+  private timingPackTotal   = 0
+  private timingChunkCount  = 0
+
   // Frame loop
   private currentFrame = 0
+  private lastCameraMovedFrame = -1
+  private readonly lastViewProjElements = new Float32Array(16)
   private rafHandle: number | null = null
   private resizeObserver: ResizeObserver | null = null
   private disposed = false
@@ -198,6 +211,7 @@ export class WebGPURenderer {
   private readonly edlStrength: number
   private readonly edlRadius: number
   private readonly onFrame?: (info: FrameInfo) => void
+  private chunkEvictedCallback: ((chunkIndex: number) => void) | null = null
 
   // --- Constructor / factory ------------------------------------------------
 
@@ -209,15 +223,10 @@ export class WebGPURenderer {
     this.onFrame     = options.onFrame
 
     const ringCapacity = options.ringBufferCapacity ?? ctx.ringBufferCapacity
-    this.slots = new RingBufferAllocator(ringCapacity)
+    this.slots = new RingBufferAllocator(ringCapacity)  // v2: variable-size free-list
     this.freeUniformSlotIdxs = Array.from({ length: MAX_SLOTS }, (_, i) => MAX_SLOTS - 1 - i)
     // (Stored as a stack — pop() returns lowest idx first since we built it
     //  reversed. Order doesn't actually matter; we just need O(1) get/release.)
-
-    // Dynamic-offset minimum alignment is device-reported. Default is 256.
-    // Pad CHUNK_UNIFORM_BYTES (32) up to the alignment.
-    const align = this.device.limits.minUniformBufferOffsetAlignment ?? 256
-    this.chunkUniformStride = Math.max(align, Math.ceil(CHUNK_UNIFORM_BYTES / align) * align)
 
     // --- Static buffers ---------------------------------------------------
     this.ringBuffer = this.device.createBuffer({
@@ -232,17 +241,23 @@ export class WebGPURenderer {
     })
     this.chunkUniform = this.device.createBuffer({
       label: 'lazstream/chunk-uniform',
-      size: MAX_SLOTS * this.chunkUniformStride,
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      size: MAX_SLOTS * CHUNK_UNIFORM_BYTES,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
     })
     this.viewportUniform = this.device.createBuffer({
       label: 'lazstream/viewport-uniform',
       size: VIEWPORT_UNIFORM_BYTES,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     })
+    this.visibleSlotListBuf = this.device.createBuffer({
+      label: 'lazstream/visible-slot-list',
+      size: MAX_SLOTS * 4,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    })
 
-    this.cameraUniformView   = new Float32Array(CAMERA_UNIFORM_BYTES / 4)
-    this.chunkUniformScratch = new Float32Array(this.chunkUniformStride / 4)
+    this.cameraUniformView      = new Float32Array(CAMERA_UNIFORM_BYTES / 4)
+    this.chunkUniformScratch    = new Float32Array(CHUNK_UNIFORM_BYTES / 4)
+    this.visibleSlotListScratch = new Uint32Array(MAX_SLOTS)
 
     // --- Bind group layouts -----------------------------------------------
     this.clearBindLayout = this.device.createBindGroupLayout({
@@ -257,12 +272,11 @@ export class WebGPURenderer {
       label: 'lazstream/depth-bgl',
       entries: [
         { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
-        { binding: 1, visibility: GPUShaderStage.COMPUTE,
-          buffer: { type: 'uniform', hasDynamicOffset: true,
-                    minBindingSize: CHUNK_UNIFORM_BYTES } },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
         { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
         { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
         { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+        { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
       ],
     })
 
@@ -406,7 +420,24 @@ export class WebGPURenderer {
   addDecodedChunk(chunk: DecodedChunk): void {
     if (this.disposed) return
 
+    const packT0 = performance.now()
     const packed = packChunk(chunk)
+    const packMs = performance.now() - packT0
+
+    this.timingDecodeTotal += chunk.decodeMs
+    this.timingPackTotal   += packMs
+    this.timingChunkCount++
+    if (this.timingChunkCount % this.TIMING_LOG_INTERVAL === 0) {
+      const n = this.TIMING_LOG_INTERVAL
+      console.debug(
+        `[lazstream/timing] last ${n} chunks — ` +
+        `decode avg ${(this.timingDecodeTotal / n).toFixed(1)} ms  ` +
+        `pack avg ${(this.timingPackTotal / n).toFixed(2)} ms`
+      )
+      this.timingDecodeTotal = 0
+      this.timingPackTotal   = 0
+    }
+
     const min: [number, number, number]   = [chunk.minX, chunk.minY, chunk.minZ]
     const range: [number, number, number] = [
       (chunk.maxX - chunk.minX) || 1,
@@ -426,14 +457,15 @@ export class WebGPURenderer {
     // after the cull may have freed an LRU slot. Bounded queue length;
     // overflow drops the oldest deferred chunk and increments a counter.
     if (this.deferredChunks.length >= this.MAX_DEFERRED_CHUNKS) {
-      this.deferredChunks.shift()
+      const dropped = this.deferredChunks.shift()!
       this.deferredOverflowCount++
-      // Rate-limited warning so we know if camera movement is consistently
-      // outpacing buffer turnover.
+      // Notify engine so the dropped chunk can be re-queued when the camera
+      // returns to it (same path as proactive GPU eviction).
+      this.chunkEvictedCallback?.(dropped.chunkIndex)
       if (this.deferredOverflowCount % 25 === 1) {
         console.warn(
-          `[webgpu] deferred queue overflow: ${this.deferredOverflowCount} chunks ` +
-          `permanently lost (camera moving faster than ring buffer can absorb)`
+          `[webgpu] deferred queue overflow: ${this.deferredOverflowCount} chunks dropped ` +
+          `(will re-fetch when camera revisits)`
         )
       }
     }
@@ -452,9 +484,10 @@ export class WebGPURenderer {
    * just-completed frame's visibility — LRU-evictable slots are the ones not
    * touched this frame, which is what we want to overwrite.
    *
-   * Stops at the first chunk that still can't fit — all deferred chunks have
-   * identical byteLength (one slot each), so if one fails to allocate, the
-   * rest will too. Cheap when the queue is empty (common case).
+   * Stops at the first chunk that still can't fit — a failed allocate() means
+   * all evictable slots have been exhausted (every remaining slot was visible
+   * this frame), so subsequent allocations in the same frame will also fail.
+   * Cheap when the queue is empty (common case).
    */
   private flushDeferredChunks(): void {
     while (this.deferredChunks.length > 0) {
@@ -497,10 +530,10 @@ export class WebGPURenderer {
    * Cheap O(slotCount) — called once per engine tick.
    */
   getRingBufferStatus(): { slotsFree: number; slotsTotal: number } {
-    const m = this.slots.metrics()
     return {
       slotsFree: this.slots.getAvailableCount(this.currentFrame),
-      slotsTotal: m.slotCount,
+      // slotsTotal: estimated capacity in avg-sized chunks (self-tuning; cold = DEFAULT_MAX_CHUNK_BYTES)
+      slotsTotal: Math.floor(this.slots.capacity / this.slots.avgChunkBytes()),
     }
   }
 
@@ -553,6 +586,11 @@ export class WebGPURenderer {
     this.deferredChunks = []
     this.deferredOverflowCount = 0
 
+    // Timing accumulators → reset for fresh load
+    this.timingDecodeTotal = 0
+    this.timingPackTotal   = 0
+    this.timingChunkCount  = 0
+
     // Force a camera uniform write next frame so sceneCenter change lands
     this.cameraDirty = true
   }
@@ -567,6 +605,11 @@ export class WebGPURenderer {
   /** Current canvas height in pixels (after DPR scaling). Used by SSE calc. */
   getCanvasHeight(): number {
     return this.viewportPixels.h
+  }
+
+  /** Set point splat size. 1 = 1×1 px (default), 2 = 3×3, 3 = 5×5. */
+  setSplatRadius(n: number): void {
+    this.splatRadius = Math.max(1, Math.round(n))
   }
 
   /**
@@ -663,26 +706,36 @@ export class WebGPURenderer {
       chunkIndex, byteLength, pointCount, min, range, this.currentFrame,
     )
     if (!result) {
-      // Not a permanent drop — the caller (addDecodedChunk or
-      // flushDeferredChunks) queues the chunk for retry next frame after
-      // the cull may have freed an LRU slot.
+      // Permanent rejection: chunk too large for total buffer capacity. Drop it.
       return false
     }
 
-    // Return uniform-slot indices of evicted slots to the free pool.
+    // Process all defrag-by-eviction casualties regardless of allocation success.
+    // Invariant 10: evictions from allocate() must clear the same three sets as
+    // proactive eviction — otherwise orphaned chunks never get re-fetched.
     for (const evicted of result.evicted) {
       const idx = this.chunkToUniformIdx.get(evicted.chunkIndex)
       if (idx !== undefined) {
         this.freeUniformSlotIdxs.push(idx)
         this.chunkToUniformIdx.delete(evicted.chunkIndex)
       }
+      if (evicted.everRendered) this.chunkEvictedCallback?.(evicted.chunkIndex)
+    }
+    if (result.evicted.length > 0) {
+      console.debug(`[ring-buffer] defrag: evicted ${result.evicted.length} slot(s) to fit chunk ${chunkIndex}`)
+    }
+
+    if (!result.slot) {
+      // All slots were visible this frame — deferred queue will retry next frame
+      // once the cull marks some slots as non-visible.
+      return false
     }
 
     // Assign a fresh uniform slot.
     const uniformIdx = this.freeUniformSlotIdxs.pop()!
     this.chunkToUniformIdx.set(chunkIndex, uniformIdx)
 
-    // Upload point data into the ring buffer at the allocated offset.
+    // Upload point data into the ring buffer at the allocated byte offset.
     this.device.queue.writeBuffer(
       this.ringBuffer,
       result.slot.byteOffset,
@@ -706,10 +759,10 @@ export class WebGPURenderer {
 
     this.device.queue.writeBuffer(
       this.chunkUniform,
-      uniformIdx * this.chunkUniformStride,
+      uniformIdx * CHUNK_UNIFORM_BYTES,
       u.buffer,
       u.byteOffset,
-      this.chunkUniformStride,
+      CHUNK_UNIFORM_BYTES,
     )
 
     return true
@@ -722,6 +775,33 @@ export class WebGPURenderer {
       this.chunkToUniformIdx.delete(chunkIndex)
     }
     this.slots.remove(chunkIndex)
+  }
+
+  /** Register a callback invoked when a chunk is proactively evicted because
+   *  it has been invisible for EVICT_GRACE_FRAMES consecutive frames.
+   *  The engine uses this to remove the chunk from its decoded set so it will
+   *  be re-fetched when the camera returns. */
+  setChunkEvictedCallback(cb: (chunkIndex: number) => void): void {
+    this.chunkEvictedCallback = cb
+  }
+
+private evictInvisibleSlots(): void {
+    const threshold = this.currentFrame - EVICT_GRACE_FRAMES
+    const toEvict: Array<{ chunkIndex: number; wasRendered: boolean }> = []
+    for (const slot of this.slots.getSlots()) {
+      if (slot.chunkIndex === SEED_PSEUDO_CHUNK_INDEX) continue
+      if (slot.lastRenderedFrame < threshold) {
+        toEvict.push({ chunkIndex: slot.chunkIndex, wasRendered: slot.everRendered })
+      }
+    }
+    for (const { chunkIndex, wasRendered } of toEvict) {
+      this.releaseSlot(chunkIndex)
+      // Only re-queue chunks that were actually rendered at least once.
+      // Phantom chunks (passed AABB dispatch but failed exact 6-plane test)
+      // never get touch() called — evicting them without re-queuing breaks
+      // the oscillation loop they'd otherwise cause.
+      if (wasRendered) this.chunkEvictedCallback?.(chunkIndex)
+    }
   }
 
   // --- Resize / viewport handling ------------------------------------------
@@ -774,10 +854,11 @@ export class WebGPURenderer {
       layout: this.depthBindLayout,
       entries: [
         { binding: 0, resource: { buffer: this.cameraUniform } },
-        { binding: 1, resource: { buffer: this.chunkUniform, size: CHUNK_UNIFORM_BYTES } },
+        { binding: 1, resource: { buffer: this.chunkUniform } },
         { binding: 2, resource: { buffer: this.ringBuffer } },
         { binding: 3, resource: { buffer: this.depthBuffer } },
         { binding: 4, resource: { buffer: this.colorBuffer } },
+        { binding: 5, resource: { buffer: this.visibleSlotListBuf } },
       ],
     })
 
@@ -807,6 +888,15 @@ export class WebGPURenderer {
     this.camera.updateMatrixWorld()
     this.viewProj.multiplyMatrices(this.camera.projectionMatrix, this.camera.matrixWorldInverse)
 
+    const el = this.viewProj.elements
+    for (let i = 0; i < 16; i++) {
+      if (el[i] !== this.lastViewProjElements[i]) {
+        this.lastCameraMovedFrame = this.currentFrame
+        this.lastViewProjElements.set(el)
+        break
+      }
+    }
+
     const v = this.cameraUniformView
     // mat4x4<f32> at offset 0..63 (16 floats, column-major — Three.js native)
     v.set(this.viewProj.elements, 0)
@@ -819,7 +909,7 @@ export class WebGPURenderer {
     v[20] = this.sceneCenter.x
     v[21] = this.sceneCenter.y
     v[22] = this.sceneCenter.z
-    v[23] = 0
+    v[23] = this.splatRadius
 
     this.device.queue.writeBuffer(this.cameraUniform, 0, v.buffer, v.byteOffset, v.byteLength)
   }
@@ -877,6 +967,11 @@ export class WebGPURenderer {
       const cy = this.sceneCenter.y
       const cz = this.sceneCenter.z
 
+      // Build visible slot list on CPU (same AABB cull as before), then
+      // issue a single 2D dispatch instead of N setBindGroup+dispatch calls.
+      let visibleCount = 0
+      let maxPointCount = 0
+
       for (const slot of this.slots.getSlots()) {
         if (slot.pointCount === 0) continue
 
@@ -895,12 +990,30 @@ export class WebGPURenderer {
 
         const uniformIdx = this.chunkToUniformIdx.get(slot.chunkIndex)
         if (uniformIdx === undefined) continue // shouldn't happen
-        pass.setBindGroup(0, this.depthBindGroup, [uniformIdx * this.chunkUniformStride])
-        pass.dispatchWorkgroups(Math.ceil(slot.pointCount / COMPUTE_WORKGROUP_SIZE))
+        this.visibleSlotListScratch[visibleCount++] = uniformIdx
+        if (slot.pointCount > maxPointCount) maxPointCount = slot.pointCount
         // Touch for LRU bookkeeping — this slot was rendered this frame.
         this.slots.touch(slot.chunkIndex, this.currentFrame)
       }
+
+      if (visibleCount > 0) {
+        this.device.queue.writeBuffer(
+          this.visibleSlotListBuf, 0,
+          this.visibleSlotListScratch.buffer, 0, visibleCount * 4,
+        )
+        const maxWG = Math.ceil(maxPointCount / COMPUTE_WORKGROUP_SIZE)
+        pass.setBindGroup(0, this.depthBindGroup)
+        pass.dispatchWorkgroups(maxWG, visibleCount, 1)
+      }
       pass.end()
+    }
+
+    // Proactively free slots that have been invisible for EVICT_GRACE_FRAMES.
+    // Only runs while the camera is moving (or just stopped) — skipping eviction
+    // on a stationary camera prevents the continuous evict→re-decode cycle that
+    // occurs when the ring buffer is full and chunks cycle at worker speed.
+    if (this.currentFrame - this.lastCameraMovedFrame <= EVICT_GRACE_FRAMES) {
+      this.evictInvisibleSlots()
     }
 
     // Retry any chunks that arrived from decode but couldn't fit at the time —

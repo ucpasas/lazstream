@@ -1,159 +1,136 @@
 /**
- * Ring buffer allocator — Phase 3 Track B (v1: fixed-slot).
+ * Ring buffer allocator — Phase 3 Track B (v2: variable-size free-list).
  *
  * Pure CPU-side bookkeeping for a single contiguous GPU storage buffer.
  * No WebGPU types touched here — fully unit-testable in isolation.
  *
  * ─────────────────────────────────────────────────────────────────────
- * THIS REPLACES the previous first-fit variable-size allocator.
+ * v1 (fixed-slot) allocated every chunk a fixed 700 KB slot. Simple and
+ * fragmentation-free, but wasteful: a 120 KB chunk still occupied 700 KB,
+ * and a 786 KB COPC node was outright rejected (too large for the slot).
  *
- * The old allocator suffered fragmentation: gaps from evicted slots could
- * not be reused if a new chunk was even one byte larger than the largest
- * gap. At Melbourne scale (7073 chunks of ~600 KB each), this dropped
- * chunks past ~447 resident — total free bytes were ample, but no single
- * gap fit. See [[Renderer]] "Ring buffer fragmentation at Melbourne scale".
+ * v2 strategy: variable-size allocations via a free-list. Each chunk
+ * receives exactly the bytes it needs (4-byte aligned), with zero tail
+ * waste. Fragmentation is handled by defrag-by-eviction: when no single
+ * free gap is large enough, the allocator evicts LRU non-visible slots
+ * one at a time — coalescing after each — until a contiguous gap of the
+ * needed size forms or no more slots are evictable.
  *
- * B-2 strategy: every slot has a fixed byte size, established at
- * construction. Any free slot fits any chunk ≤ slotBytes. Fragmentation
- * is impossible by construction.
+ * Memory layout (illustrative — offsets are variable):
  *
- *   ┌─────────┬─────────┬─────────┬───── ... ─┬─────────┐
- *   │ slot 0  │ slot 1  │ slot 2  │           │ slot N-1│
- *   │ slotByt │ slotByt │ slotByt │   ...     │ slotByt │
- *   └─────────┴─────────┴─────────┴───── ... ─┴─────────┘
- *     ▲ byteOffset for slot i is always i × slotBytes
- *     ▲ actual data may use less than slotBytes (tail unused)
+ *   ┌──────────┬────────┬───────────┬──────────┬────── ... ─┐
+ *   │ chunk A  │  free  │  chunk B  │  chunk C │            │
+ *   │ 600 KB   │ 200 KB │  120 KB   │  600 KB  │    free    │
+ *   └──────────┴────────┴───────────┴──────────┴────── ... ─┘
+ *     ▲ byteOffset tracked per slot, not derived from index
  *
  * ─────────────────────────────────────────────────────────────────────
- * PRIORITY FOLLOW-UP: B-1 GPU compaction.
+ * GPU compaction deferred decision:
  *
- * B-2 accepts ~16% per-slot waste. At 700 KB slots × ~374 slots resident,
- * that's ~43 MB of dead space on a 256 MB ring — not negligible on
- * memory-constrained browsers (mobile, low-end laptops, busy tabs).
+ * Full compaction (copyBufferToBuffer defrag) would require a second
+ * ring buffer of equal size (2× GPU memory) to avoid same-buffer copy
+ * overlap — since a chunk typically moves by less than its own length
+ * during compaction. Given that the IDB cache makes re-decoding from
+ * eviction cheap (~56 ms, zero network), defrag-by-eviction is the
+ * correct tradeoff: simpler, no memory penalty, corrected by the cache.
  *
- * B-1 is the planned next iteration: variable-size slots + periodic
- * GPU-side compaction (copyBufferToBuffer to close gaps between frames).
- * Achieves zero waste at the cost of ~0.5 ms compaction frames and
- * meaningful implementation complexity (GPU sync, uniform fix-ups,
- * frame coordination). Design and trade-offs in planning doc §4.2.
- *
- * Promote B-1 to the active iteration as soon as:
- *   (a) we have telemetry showing the 43 MB waste is biting users, OR
- *   (b) we need to support files with chunks larger than slotBytes
- *       (variable-chunk COPC files at 65,535 pts × 12 B = 786 KB).
- *
- * Until then, B-2 is shipped because fragmentation is currently
- * dropping chunks in production and B-2 fixes that immediately.
  * ─────────────────────────────────────────────────────────────────────
- *
- * Other compromises in B-2 (vs B-1):
- *   - Slot count drops to ~374 (vs ~430 pre-fragmentation in the
- *     variable allocator). Capacity penalty for fragmentation immunity.
- *   - slotBytes is fixed at construction. Pathological files with
- *     chunks > slotBytes are rejected (logged + dropped). Per-file
- *     sizing (slotBytes derived from chunk table max) is a follow-up
- *     bundled with B-1.
- *   - The per-slot tail bytes are addressable but unused. The GPU
- *     buffer is fully allocated; we just don't write to those bytes.
- *
  * Frame-coherence invariant: a slot rendered in the current frame is
  * NEVER evicted. Visible-set = lastRenderedFrame >= currentFrame.
+ *
+ * Invariant 10 — Defrag-by-eviction ordering: When allocate() cannot
+ * find a contiguous gap, it evicts LRU slots one at a time, coalescing
+ * after each eviction, and retries firstFit after each step. Evictions
+ * stop when (a) a gap is found, or (b) all remaining slots are visible
+ * this frame. All evictions are returned in AllocateResult.evicted
+ * regardless of whether the allocation ultimately succeeded.
  */
 
 export interface Slot {
   chunkIndex: number
-  /** Byte offset into the GPU buffer. In B-2 always slotIndex × slotBytes. */
+  /** Byte offset into the GPU buffer — variable; NOT derivable from an index. */
   byteOffset: number
-  /** Length in bytes of the ACTUAL chunk data uploaded into this slot.
-   *  May be less than slotBytes; the tail of the slot is unused (this is
-   *  the B-2 memory cost). */
+  /** Actual data bytes uploaded into this range. No wasted tail bytes. */
   byteLength: number
   pointCount: number
-  /** Per-chunk dequantization origin (world coords). */
   min: [number, number, number]
-  /** Per-chunk dequantization range (world coords, max - min). */
   range: [number, number, number]
-  /** Last frame this slot was rendered. -1 if never. */
+  /** Last frame this slot was rendered. Initialised to currentFrame-1. */
   lastRenderedFrame: number
+  /** True once touch() has been called at least once. Distinguishes phantom
+   *  chunks (pass AABB dispatch, fail exact 6-plane test) from chunks that
+   *  were genuinely visible and then moved off-screen. Used by proactive
+   *  eviction to decide whether to re-queue via chunkEvictedCallback. */
+  everRendered: boolean
 }
 
 export interface AllocateResult {
-  slot: Slot
-  /** Slots that had to be evicted to make room. Caller may want to log/observe. */
+  /** The newly allocated slot, or null if all slots were visible this frame
+   *  and no evictable slot could be found after defrag attempts. Caller
+   *  should push to the deferred queue when null. */
+  slot: Slot | null
+  /** Slots that were evicted during defrag-by-eviction to make room.
+   *  Non-empty even when slot===null (if defrag ran partway before exhausting
+   *  evictable slots). Caller MUST process these — return uniform indices,
+   *  call chunkEvictedCallback — regardless of slot success. */
   evicted: Slot[]
 }
 
 export interface RingBufferMetrics {
   capacity: number
-  slotBytes: number
-  slotCount: number
-  slotsUsed: number
-  slotsFree: number
-  /** Actual chunk data bytes (sum of slot.byteLength over used slots). */
-  bytesActualData: number
-  /** Bytes reserved for used slots (slotsUsed × slotBytes). */
-  bytesAllocated: number
-  /** Dead space inside used-slot tails (bytesAllocated − bytesActualData). */
-  bytesWasted: number
+  /** Number of live chunks in the buffer. */
+  chunkCount: number
+  /** Sum of actual data bytes across all live slots. */
+  bytesUsed: number
+  /** Total bytes across all free gaps. */
+  bytesFree: number
+  /** Largest single contiguous free region. */
+  largestFreeGap: number
+  /** (bytesFree - largestFreeGap) / bytesFree. 0 when bytesFree===0. */
+  fragmentationRatio: number
+  /** Running average of chunk sizes seen so far (or DEFAULT_MAX_CHUNK_BYTES
+   *  before the first allocation). Used by getAvailableCount(). */
+  avgChunkBytes: number
+}
+
+interface FreeRegion {
+  offset: number
+  length: number
 }
 
 /**
- * Default slot size: 700 KB. Sized for PDAL default 50,000-point chunks
- * at PDRF 6 packed (12 B/pt) = 600,000 bytes + ~16% headroom.
- *
- * Override via the constructor when sizing for a specific file is
- * possible. COPC files with up to 65,535-point chunks need ~800 KB.
- * Per-file auto-sizing is a planned follow-up alongside B-1.
+ * Cold-start fallback for getAvailableCount() and slotsTotal before the
+ * first allocation provides a real average. 800 KB covers COPC max
+ * (65535 pts × 12 B = 786 KB) with a small safety margin.
  */
-export const DEFAULT_SLOT_BYTES = 700 * 1024
+export const DEFAULT_MAX_CHUNK_BYTES = 800 * 1024
 
 export class RingBufferAllocator {
-  readonly slotBytes: number
-  readonly slotCount: number
+  /** All live slots, keyed by chunkIndex. */
+  private readonly slots = new Map<number, Slot>()
+  /** Free contiguous regions. Kept sorted by offset and coalesced on dealloc. */
+  private freeList: FreeRegion[]
 
-  /** slotsByIndex[i] is the Slot occupying slot i, or null if free. */
-  private slotsByIndex: (Slot | null)[]
-  private chunkToSlotIdx = new Map<number, number>()
-  /** Free slot indices, stack — pop returns one in O(1). */
-  private freeStack: number[]
+  // Self-tuning denominator for getAvailableCount().
+  private allocCount = 0
+  private allocBytesTotal = 0
 
-  constructor(
-    public readonly capacity: number,
-    slotBytes: number = DEFAULT_SLOT_BYTES,
-  ) {
-    if (slotBytes <= 0) {
-      throw new Error(`RingBufferAllocator: slotBytes must be positive, got ${slotBytes}`)
-    }
-    if (slotBytes % 4 !== 0) {
-      throw new Error(`RingBufferAllocator: slotBytes ${slotBytes} not multiple of 4 (WGSL u32 alignment)`)
-    }
-    this.slotBytes = slotBytes
-    this.slotCount = Math.floor(capacity / slotBytes)
-    if (this.slotCount === 0) {
-      throw new Error(
-        `RingBufferAllocator: capacity ${capacity} < slotBytes ${slotBytes} — no slots can fit`
-      )
-    }
-    this.slotsByIndex = new Array(this.slotCount).fill(null)
-    // Free stack initialised in reverse so pop() returns slot 0 first.
-    this.freeStack = new Array(this.slotCount)
-    for (let i = 0; i < this.slotCount; i++) {
-      this.freeStack[i] = this.slotCount - 1 - i
-    }
+  constructor(public readonly capacity: number) {
+    this.freeList = [{ offset: 0, length: capacity }]
   }
 
   /**
-   * Try to place a new chunk of `byteLength` bytes.
+   * Allocate byteLength bytes for a new chunk.
    *
-   * @param chunkIndex caller's identifier — typically the LAZ chunk index;
-   *                   use a negative number for non-chunk data (e.g. -1 for seeds)
-   * @param byteLength actual data size in bytes; must be ≤ slotBytes and
-   *                   a multiple of 4 (WGSL u32 alignment)
-   * @param min/range per-chunk dequantization parameters
-   * @param currentFrame the frame number of the in-progress render
+   * @param byteLength  must be a multiple of 4 (WGSL u32 alignment)
    *
-   * Returns null if the chunk cannot fit — either it's too large for a
-   * slot (logged warning), or all slots are visible this frame (silent).
+   * Returns an AllocateResult in all non-fatal cases. `result.slot` is
+   * non-null on success; null when allocation failed (all slots visible).
+   * `result.evicted` is always populated with any evictions that occurred
+   * during defrag — caller must process them even when slot is null.
+   *
+   * Returns null (not AllocateResult) only for the permanent rejection
+   * case: byteLength > capacity. Caller should log and discard the chunk.
    */
   allocate(
     chunkIndex: number,
@@ -166,189 +143,234 @@ export class RingBufferAllocator {
     if (byteLength % 4 !== 0) {
       throw new Error(`RingBufferAllocator: byteLength ${byteLength} not multiple of 4`)
     }
-    if (byteLength > this.slotBytes) {
+    if (byteLength > this.capacity) {
       console.warn(
-        `[ring-buffer] chunk ${chunkIndex} byteLength ${byteLength} > slotBytes ${this.slotBytes} — rejected. ` +
-        `This file has chunks larger than the allocator can hold. Increase slotBytes via constructor, ` +
-        `or wait for B-1 compaction + per-file sizing.`
+        `[ring-buffer] chunk ${chunkIndex} byteLength ${byteLength} B ` +
+        `exceeds total capacity ${this.capacity} B — rejected permanently`,
       )
       return null
     }
 
-    // Existing slot for this chunk? Refresh its visibility window and return.
-    // (Duplicate adds shouldn't happen because WorkerPool dedupes, but defend.)
-    const existingIdx = this.chunkToSlotIdx.get(chunkIndex)
-    if (existingIdx !== undefined) {
-      const slot = this.slotsByIndex[existingIdx]!
-      slot.lastRenderedFrame = Math.max(slot.lastRenderedFrame, currentFrame - 1)
-      return { slot, evicted: [] }
+    // Duplicate add — refresh visibility window and return (WorkerPool
+    // deduplicates upstream, but defend against races).
+    const existing = this.slots.get(chunkIndex)
+    if (existing) {
+      existing.lastRenderedFrame = Math.max(existing.lastRenderedFrame, currentFrame - 1)
+      return { slot: existing, evicted: [] }
     }
 
     const evicted: Slot[] = []
-    let slotIdx: number
 
-    if (this.freeStack.length > 0) {
-      // Fast path: a free slot is available.
-      slotIdx = this.freeStack.pop()!
-    } else {
-      // No free slots — evict the LRU non-visible slot.
-      const victimIdx = this.findLRUEvictableIndex(currentFrame)
-      if (victimIdx === -1) return null  // every slot is visible — refuse
+    while (true) {
+      const regionIdx = this.findFirstFit(byteLength)
+      if (regionIdx !== -1) {
+        const region = this.freeList[regionIdx]
+        const byteOffset = region.offset
+        if (region.length === byteLength) {
+          this.freeList.splice(regionIdx, 1)
+        } else {
+          region.offset += byteLength
+          region.length -= byteLength
+        }
+        const slot: Slot = {
+          chunkIndex,
+          byteOffset,
+          byteLength,
+          pointCount,
+          min,
+          range,
+          // Start at currentFrame-1 so the slot has the full EVICT_GRACE_FRAMES
+          // window before proactive eviction can touch it.
+          lastRenderedFrame: currentFrame - 1,
+          everRendered: false,
+        }
+        this.slots.set(chunkIndex, slot)
+        this.allocCount++
+        this.allocBytesTotal += byteLength
+        return { slot, evicted }
+      }
 
-      const victim = this.slotsByIndex[victimIdx]!
-      evicted.push(victim)
-      this.chunkToSlotIdx.delete(victim.chunkIndex)
-      this.slotsByIndex[victimIdx] = null
-      slotIdx = victimIdx
+      // No contiguous gap large enough — evict the LRU non-visible slot to
+      // create (and potentially coalesce) a larger free region.
+      const victimKey = this.findLRUEvictableKey(currentFrame)
+      if (victimKey === null) {
+        // All remaining slots are visible this frame — can't evict.
+        // Return the partial result so the caller can process the evictions
+        // that already happened and defer the new chunk for next frame.
+        return { slot: null, evicted }
+      }
+      evicted.push(this.slots.get(victimKey)!)
+      this.doRemove(victimKey)
     }
-
-    const slot: Slot = {
-      chunkIndex,
-      byteOffset: slotIdx * this.slotBytes,
-      byteLength,
-      pointCount,
-      min,
-      range,
-      lastRenderedFrame: -1,
-    }
-    this.slotsByIndex[slotIdx] = slot
-    this.chunkToSlotIdx.set(chunkIndex, slotIdx)
-    return { slot, evicted }
   }
 
-  /** Find the slot index with the lowest lastRenderedFrame that is not visible. */
-  private findLRUEvictableIndex(currentFrame: number): number {
-    let victim = -1
+  private findFirstFit(byteLength: number): number {
+    for (let i = 0; i < this.freeList.length; i++) {
+      if (this.freeList[i].length >= byteLength) return i
+    }
+    return -1
+  }
+
+  private findLRUEvictableKey(currentFrame: number): number | null {
+    let victim: number | null = null
     let oldestFrame = Infinity
-    for (let i = 0; i < this.slotCount; i++) {
-      const slot = this.slotsByIndex[i]
-      if (!slot) continue
-      if (slot.lastRenderedFrame >= currentFrame) continue  // visible this frame
+    for (const [key, slot] of this.slots) {
+      if (slot.lastRenderedFrame >= currentFrame) continue
       if (slot.lastRenderedFrame < oldestFrame) {
         oldestFrame = slot.lastRenderedFrame
-        victim = i
+        victim = key
       }
     }
     return victim
   }
 
+  /** Internal remove: frees the slot's bytes back into freeList and coalesces. */
+  private doRemove(chunkIndex: number): void {
+    const slot = this.slots.get(chunkIndex)!
+    this.slots.delete(chunkIndex)
+    this.freeList.push({ offset: slot.byteOffset, length: slot.byteLength })
+    this.coalesceFreeList()
+  }
+
+  private coalesceFreeList(): void {
+    if (this.freeList.length <= 1) return
+    this.freeList.sort((a, b) => a.offset - b.offset)
+    const out: FreeRegion[] = []
+    for (const r of this.freeList) {
+      const last = out.at(-1)
+      if (last && last.offset + last.length >= r.offset) {
+        last.length = Math.max(last.length, r.offset + r.length - last.offset)
+      } else {
+        out.push({ offset: r.offset, length: r.length })
+      }
+    }
+    this.freeList = out
+  }
+
   /** Mark a slot as rendered in the given frame. */
   touch(chunkIndex: number, frame: number): void {
-    const idx = this.chunkToSlotIdx.get(chunkIndex)
-    if (idx === undefined) return
-    const slot = this.slotsByIndex[idx]
-    if (slot) slot.lastRenderedFrame = frame
+    const slot = this.slots.get(chunkIndex)
+    if (slot) {
+      slot.lastRenderedFrame = frame
+      slot.everRendered = true
+    }
   }
 
   /** Get a slot by chunk index. */
   getSlot(chunkIndex: number): Slot | undefined {
-    const idx = this.chunkToSlotIdx.get(chunkIndex)
-    return idx !== undefined ? (this.slotsByIndex[idx] ?? undefined) : undefined
+    return this.slots.get(chunkIndex)
   }
 
-  /** Drop a specific slot. Used to remove the seed pseudo-chunk once real chunks land. */
+  /**
+   * Public eviction interface — called by proactive eviction and releaseSlot.
+   * Returns false if the chunk was not in the buffer.
+   */
   remove(chunkIndex: number): boolean {
-    const idx = this.chunkToSlotIdx.get(chunkIndex)
-    if (idx === undefined) return false
-    this.slotsByIndex[idx] = null
-    this.chunkToSlotIdx.delete(chunkIndex)
-    this.freeStack.push(idx)
+    if (!this.slots.has(chunkIndex)) return false
+    this.doRemove(chunkIndex)
     return true
   }
 
   /**
-   * Drop ALL slots. Used by the renderer's reset() on new file load —
-   * empties bookkeeping so the next chunk allocations start from a
-   * fresh empty ring. The underlying GPU buffer contents are orphaned
-   * but become irrelevant once the depth buffer is cleared on the
-   * next frame (slots = 0 means no compute pass runs, so the resolve
-   * shader sees only the depth sentinel and outputs the background
-   * clearValue).
+   * Drop ALL slots. Used by the renderer's reset() on new file load.
+   * The underlying GPU buffer contents become irrelevant once the depth
+   * buffer is cleared on the next frame (empty slot table → no compute
+   * pass writes new depth/color).
    */
   clear(): void {
-    this.slotsByIndex = new Array(this.slotCount).fill(null)
-    this.chunkToSlotIdx.clear()
-    this.freeStack = new Array(this.slotCount)
-    for (let i = 0; i < this.slotCount; i++) {
-      this.freeStack[i] = this.slotCount - 1 - i
-    }
+    this.slots.clear()
+    this.freeList = [{ offset: 0, length: this.capacity }]
+    this.allocCount = 0
+    this.allocBytesTotal = 0
   }
 
-  /**
-   * Current slots, populated only (skips empty slot indices).
-   * Caller must not mutate. Allocates a new array per call (~once/frame
-   * from the render loop's iteration); optimise if perf shows it.
-   */
+  /** Current slots (populated only). Allocates a new array per call. */
   getSlots(): readonly Slot[] {
-    const result: Slot[] = []
-    for (const slot of this.slotsByIndex) {
-      if (slot !== null) result.push(slot)
-    }
-    return result
+    return [...this.slots.values()]
   }
 
-  /** Sum of actual data bytes across used slots (not the dead-space tails). */
+  /** Sum of actual data bytes across all live slots. */
   bytesUsed(): number {
     let sum = 0
-    for (const slot of this.slotsByIndex) {
-      if (slot !== null) sum += slot.byteLength
-    }
+    for (const slot of this.slots.values()) sum += slot.byteLength
     return sum
   }
 
-  /** Total points across all current slots. */
+  /** Total point count across all live slots. */
   pointsLoaded(): number {
     let sum = 0
-    for (const slot of this.slotsByIndex) {
-      if (slot !== null) sum += slot.pointCount
-    }
+    for (const slot of this.slots.values()) sum += slot.pointCount
     return sum
   }
 
   /**
-   * Count of slots `allocate()` could fulfill RIGHT NOW without refusal:
-   *   free slots (never used)  +  slots not touched in the current frame
-   *                               (LRU-evictable per findLRUEvictableIndex).
+   * Running average of actual chunk sizes. Used as the denominator for
+   * getAvailableCount() and slotsTotal. Falls back to DEFAULT_MAX_CHUNK_BYTES
+   * before the first allocation (conservative cold-start).
    *
-   * This is what the engine's ring-buffer back-pressure provider must
-   * report — not `metrics().slotsFree`, which only counts the freeStack
-   * and stays at 0 forever once every slot has been used once. After the
-   * first 374 chunks fill the buffer, freeStack is permanently empty
-   * even when most slots are stale and could be evicted; that's why the
-   * engine stopped dispatching new chunks despite the CPU-side frustum
-   * cull correctly marking them non-visible.
-   *
-   * O(slotCount). Called once per engine tick (per frame), so cheap.
+   * For uniform-chunk files (raw LAZ), this converges to the exact chunk
+   * size within the first 2-3 allocations. For variable-chunk files (COPC),
+   * it reflects the mix of node sizes seen so far — the estimate may be
+   * slightly off at the start, but the deferred queue and back-pressure
+   * system absorb any resulting over- or under-dispatch.
    */
-  getAvailableCount(currentFrame: number): number {
-    let count = this.freeStack.length
-    for (let i = 0; i < this.slotCount; i++) {
-      const slot = this.slotsByIndex[i]
-      if (slot !== null && slot.lastRenderedFrame < currentFrame) count++
-    }
-    return count
+  avgChunkBytes(): number {
+    return this.allocCount > 0
+      ? this.allocBytesTotal / this.allocCount
+      : DEFAULT_MAX_CHUNK_BYTES
   }
 
   /**
-   * Diagnostics. Surface these in the telemetry overlay so we can see
-   * (a) whether B-2's waste is biting in practice and
-   * (b) how much capacity headroom we have before LRU eviction kicks in.
-   * If bytesWasted grows large or slotsFree hits 0 often, that's the
-   * signal to promote B-1.
+   * Estimated count of chunks that allocate() could accommodate RIGHT NOW —
+   * including free gaps AND bytes that would be freed by evicting LRU slots.
+   *
+   * The engine's ring-buffer back-pressure provider calls this each frame.
+   * It subtracts in-flight work from this count before dispatching new
+   * fetches — see Back-Pressure Invariants §2.
+   *
+   * O(slots). Called once per engine tick (cheap).
+   */
+  getAvailableCount(currentFrame: number): number {
+    const avg = this.avgChunkBytes()
+    let evictableBytes = 0
+    for (const slot of this.slots.values()) {
+      if (slot.lastRenderedFrame < currentFrame) evictableBytes += slot.byteLength
+    }
+    let totalFreeBytes = 0
+    for (const r of this.freeList) totalFreeBytes += r.length
+    return Math.floor((evictableBytes + totalFreeBytes) / avg)
+  }
+
+  /**
+   * Diagnostic metrics. Expose in the telemetry overlay to monitor:
+   *   (a) bytesWasted: should be near 0 in v2 (only 4-byte alignment rounding)
+   *   (b) fragmentationRatio: high value + failed allocations → defrag-evictions
+   *       firing; if frequent, consider a buddy allocator or compaction.
+   *   (c) avgChunkBytes: shows self-tuning convergence.
    */
   metrics(): RingBufferMetrics {
-    const slotsUsed = this.slotCount - this.freeStack.length
-    const bytesActualData = this.bytesUsed()
-    const bytesAllocated = slotsUsed * this.slotBytes
+    let bytesUsed = 0
+    for (const slot of this.slots.values()) bytesUsed += slot.byteLength
+
+    let bytesFree = 0
+    let largestFreeGap = 0
+    for (const r of this.freeList) {
+      bytesFree += r.length
+      if (r.length > largestFreeGap) largestFreeGap = r.length
+    }
+
+    const fragmentationRatio = bytesFree > 0
+      ? (bytesFree - largestFreeGap) / bytesFree
+      : 0
+
     return {
       capacity: this.capacity,
-      slotBytes: this.slotBytes,
-      slotCount: this.slotCount,
-      slotsUsed,
-      slotsFree: this.freeStack.length,
-      bytesActualData,
-      bytesAllocated,
-      bytesWasted: bytesAllocated - bytesActualData,
+      chunkCount: this.slots.size,
+      bytesUsed,
+      bytesFree,
+      largestFreeGap,
+      fragmentationRatio,
+      avgChunkBytes: this.avgChunkBytes(),
     }
   }
 }

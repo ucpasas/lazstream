@@ -4,7 +4,14 @@
       "WebFetch(domain:gist.github.com)",
       "WebFetch(domain:gist.githubusercontent.com)",
       "Bash(xargs -I{} du -sh /home/kisar/src/lazstream/{})",
-      "Bash(git -C /home/kisar/src/lazstream status --short)"
+      "Bash(git -C /home/kisar/src/lazstream status --short)",
+      "Bash(npx tsc *)",
+      "Read(//home/kisar/public/lib/**)",
+      "Bash(grep -E \"\\\\.\\(ts|js\\)$\")",
+      "Read(//home/kisar/src/**)",
+      "Read(//home/kisar/**)",
+      "Bash(grep -v \"^$\")",
+      "Bash(git check-ignore *)"
     ]
   }
 }

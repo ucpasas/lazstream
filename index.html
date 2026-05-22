@@ -249,6 +249,19 @@
     }
 
     #help.hidden { opacity: 0; }
+
+    /* ── Attribution (bottom-right, shown when manifest provides it) ── */
+    #attribution {
+      position: fixed;
+      bottom: 34px;
+      right: 12px;
+      color: var(--text-muted);
+      font-size: 10px;
+      opacity: 0.7;
+      pointer-events: none;
+      display: none;
+      z-index: 99;
+    }
   </style>
 </head>
 <body>
@@ -273,6 +286,9 @@
 
   <!-- Warning banner (LAZ version, CORS issues) -->
   <div id="warning"></div>
+
+  <!-- Attribution (shown when manifest provides it) -->
+  <div id="attribution"></div>
 
   <!-- Crosshair -->
   <div id="crosshair"></div>
@@ -306,7 +322,8 @@
     }
 
     loadBtn.addEventListener('click', hideHelp, { once: true })
-    if (new URLSearchParams(window.location.search).has('url')) {
+    const p = new URLSearchParams(window.location.search)
+    if (p.has('url') || p.has('manifest')) {
       hideHelp()
     }
   </script>

@@ -2,7 +2,7 @@
 title: Spatial Index
 type: project
 status: active
-updated: 2026-05-16
+updated: 2026-05-19
 tags: [rbush, spatial, frustum-culling, lod, priority-queue, sse, rbush-3d]
 ---
 
@@ -123,7 +123,7 @@ Frustum extraction (`getFrustumWorldBBox3D()` in `WebGPURenderer`) projects the 
 
 ## Open questions
 
-- [ ] `MIN_SSE_THRESHOLD` value: currently 1.0. At Melbourne overview zoom essentially all chunks pass. Tune after Track A back-pressure is in place.
+- [x] `MIN_SSE_THRESHOLD` value: **resolved** — default raised to 50.0 (aggressive zoom-to-reveal; decode only when meaningfully close). Configurable at runtime via `?sseMin=N`. Wire-through: `StreamingEngine` constructor 4th param → `ChunkPrioritiser` constructor. Note: SSE scales with `canvasHeight`, so a canvas-size-independent threshold (e.g. expressed as a distance ratio) would be more robust but is deferred.
 - [ ] Should distance threshold for LOD gating be adaptive to point density?
 
 ---

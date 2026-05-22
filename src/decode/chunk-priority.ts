@@ -22,23 +22,24 @@ import type { BBox3D } from '../types/spatial.js'
 import { bboxCentroid3D, bboxExtent3D } from '../types/spatial.js'
 
 /**
- * Minimum screen-space error to trigger a full chunk decode.
+ * Default minimum screen-space error to trigger a full chunk decode.
  *
- * A chunk's SSE is roughly "how many canvas pixels tall the chunk's
- * largest dimension projects to." At SSE < 1.0 the chunk occupies less
- * than one pixel of vertical canvas space — decoding 50k points to
- * contribute sub-pixel geometry is wasted work; the seed point already
- * represents the chunk adequately at that distance.
+ * A chunk's SSE is "how many canvas pixels tall the chunk's largest
+ * dimension projects to." At the default 50.0 a chunk must project to
+ * at least 50 pixels before its seed point is replaced by 50k decoded
+ * points — this produces aggressive zoom-to-reveal behaviour; decoding
+ * only triggers when you are meaningfully close to the data.
  *
  * Tuning guide:
- *   1.0  — conservative; seeds visible until quite close. Default.
- *   2.0  — earlier decode, smoother seed→full transition.
- *   0.5  — later decode, more frame budget for nearby chunks.
+ *   1.0  — sub-pixel only gate; nearly everything loads at any zoom.
+ *   20.0 — zoom-to-reveal for km-scale files across 1080p–4K displays.
+ *   50.0 — aggressive zoom-to-reveal; decode only when close. Default.
+ *   100.0 — very aggressive; require very close approach before any decode.
  *
- * Exposed as a named constant so the engine can make it configurable via
- * LazStreamViewer options in a future SDK pass.
+ * Configurable at runtime via ?sseMin=N URL param (see main.ts) and
+ * via StreamingEngine constructor for the SDK path.
  */
-export const MIN_SSE_THRESHOLD = 1.0
+const DEFAULT_MIN_SSE = 50.0
 
 /** Per-chunk priority result returned to the engine. */
 export interface PrioritisedChunk {
@@ -61,11 +62,13 @@ export interface CameraInfo {
 
 export class ChunkPrioritiser {
   private readonly spatial: SpatialIndex
+  private readonly sseThreshold: number
   /** Chunk indices already completed or in-flight. */
   private readonly decoded = new Set<number>()
 
-  constructor(spatial: SpatialIndex) {
+  constructor(spatial: SpatialIndex, sseThreshold?: number) {
     this.spatial = spatial
+    this.sseThreshold = sseThreshold ?? DEFAULT_MIN_SSE
   }
 
   /** Mark a chunk as decoded (or in-flight) to exclude it from future queues. */
@@ -123,7 +126,7 @@ export class ChunkPrioritiser {
 
       // Key gate: below threshold the seed point is the right representation.
       // Not zero-scored, not deferred — excluded entirely.
-      if (sse < MIN_SSE_THRESHOLD) continue
+      if (sse < this.sseThreshold) continue
 
       ranked.push({ chunkIndex: idx, sse })
     }
@@ -146,6 +149,12 @@ export class ChunkPrioritiser {
   allUndecoded(): number[] {
     const all = this.spatial.getAllChunkIndices()
     return all.filter(i => !this.decoded.has(i))
+  }
+
+  /** Remove a chunk from the decoded set so the engine will re-fetch it.
+   *  Called when the GPU ring buffer proactively evicts an invisible chunk. */
+  removeDecoded(chunkIndex: number): void {
+    this.decoded.delete(chunkIndex)
   }
 
   /** Debug stat. */

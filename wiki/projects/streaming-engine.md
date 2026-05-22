@@ -2,7 +2,7 @@
 title: Streaming Engine
 type: project
 status: active
-updated: 2026-05-18
+updated: 2026-05-22
 tags: [streaming, http2, range-request, back-pressure, scheduling, events, workers, priority]
 ---
 
@@ -60,18 +60,18 @@ type LoadState = 'idle' | 'probing' | 'header' | 'chunk-table' | 'seeds'
 ### Worker count
 
 ```typescript
-this.workerCount = workerCount ?? Math.min(32, Math.max(1, navigator.hardwareConcurrency - 1))
+this.workerCount = workerCount ?? Math.min(100, Math.max(1, navigator.hardwareConcurrency - 1))
 ```
 
-Capped at 32. With Option B fetch model (Phase 3 Track A Step 3), workers are pure WASM decoders — no longer limited by HTTP/1.1 connection count. The main-thread fetch loop is now the load-bearing concurrency control. See [[Decoder Workers]].
+Capped at 100. With Option B fetch model (Phase 3 Track A Step 3), workers are pure WASM decoders — no longer limited by HTTP/1.1 connection count. The main-thread fetch loop is now the load-bearing concurrency control. See [[Decoder Workers]].
 
 ### Camera-driven decode: `updateCamera()`
 
 ```typescript
-engine.updateCamera(cameraWorldX, cameraWorldY, cameraWorldZ)
+engine.updateCamera()   // argless — engine pulls camera + frustum from registered providers
 ```
 
-Call every frame from the render loop. The engine asks `ChunkPrioritiser` to rank undecoded chunks by inverse distance to camera, then submits the top `maxQueuedChunks` (default 16) to the worker pool. The pool deduplicates — safe to call every frame.
+Call every frame from the render loop. The engine asks `ChunkPrioritiser` to rank undecoded chunks by SSE (screen-space error), gated by frustum culling and a minimum SSE threshold (default 50.0, `?sseMin=N`). The top `slots` (capped by fetch concurrency and ring-buffer back-pressure) are dispatched to the worker pool each tick. The pool deduplicates — safe to call every frame.
 
 ### Decode-all shortcut: `decodeAll()`
 
@@ -127,7 +127,7 @@ The `signal` flows through every `fetch()` call in the engine and in `WorkerPool
 
 Fetch moves from workers to the main thread. Workers now receive pre-fetched compressed bytes via `requestDecode(chunkIndex, chunk, compressedBytes)`. See [[Decoder Workers]] for the Option B architecture.
 
-This decouples worker count (CPU/WASM parallelism) from fetch concurrency — enabling independent tuning. `maxFetches = workerCount × 2` is the main-thread concurrent fetch cap.
+This decouples worker count (CPU/WASM parallelism) from fetch concurrency. `maxFetches` is the main-thread concurrent fetch cap; see Step 7 for its current default and tuning.
 
 New engine field: `fetching: Set<number>` tracks chunks currently being fetched on the main thread. Replaced (not cleared) on each load to avoid cross-load leaks.
 
@@ -155,7 +155,11 @@ const lookups = await Promise.all(candidates.map(async (c) => ({
 
 Cache hits go straight to `pool.requestDecode()` with cached bytes — worker still decodes (cache stores compressed). Misses enter the coalesce + fetch path. After fetch, bytes are written to cache fire-and-forget before transfer to the worker. See [[Chunk Caching]].
 
-Cache is optional: `new StreamingEngine(events, workerCount, cache?)`. Omitting cache disables it cleanly.
+Constructor signature: `new StreamingEngine(events, workerCount?, cache?, sseThreshold?, maxFetches?)`. All params after `events` are optional and use defaults cleanly.
+
+**SSE threshold (4th param):** passes directly to `ChunkPrioritiser`. When omitted, `ChunkPrioritiser` uses `DEFAULT_MIN_SSE = 50.0`. Configurable at runtime via `?sseMin=N` URL param — `main.ts` parses this and forwards it as the 4th constructor arg. See [[Spatial Index]].
+
+**maxFetches (5th param):** see Step 7.
 
 ### Step 6 — Ring-buffer-aware back-pressure
 
@@ -200,6 +204,50 @@ updateCamera()
               → fetching.delete()
 ```
 
+### Step 7 — maxFetches decoupling (2026-05-20)
+
+`maxFetches` is now an independent 5th constructor param, no longer derived from `workerCount`.
+
+**Default:** `Math.min(workerCount * 4, 128)` — a 4-deep fetch pipeline per worker. With Option B (workers are pure CPU consumers), the network can handle far more concurrent range requests than the old `workerCount * 2` heuristic. More in-flight fetches keeps workers better fed during burst camera movement.
+
+**URL param:** `?maxFetches=N` — mirrors `?sseMin` and `?bufferMB`. Examples:
+- `?maxFetches=8` — throttled (visible one-by-one loading, useful for debugging)
+- `?maxFetches=128` — maximum HTTP/2 parallelism
+
+Logged at startup in the `[lazstream] StreamingEngine` debug block as `maxFetches`.
+
+### `chunkCount` getter (2026-05-23)
+
+Read-only getter exposing `this.chunks.length`:
+
+```typescript
+get chunkCount(): number { return this.chunks.length }
+```
+
+Available after the chunk-table parse stage completes (always before `onSeedsReady` fires). Used by `ManifestSession.checkAllSettled()` to compute per-tile chunk index offsets without needing an explicit callback. See [[Manifest Session]].
+
+---
+
+### Tail-end burst dispatch (2026-05-20)
+
+At the tail end of a load, `ringSlots = ringFree - inFlight` drops to near 0 even
+though workers are about to go idle — the buffer looks "committed" by in-flight
+decode work, but that work is finishing. `slots = min(ringSlots, fetchSlots) = 0`
+stalls the engine for one or more ticks, causing a visible drip.
+
+Fix: a `pipelineDry` check in `updateCamera()`:
+
+```typescript
+const effectiveCapacity = Math.min(this.workerCount, Math.max(1, navigator.hardwareConcurrency - 1))
+const pipelineDry =
+  (this.workerPool.queueLength + this.workerPool.activeCount) < effectiveCapacity
+const slots = pipelineDry ? fetchSlots : Math.min(ringSlots, fetchSlots)
+```
+
+**`effectiveCapacity` vs `workerCount`:** The threshold uses `min(workerCount, hardwareConcurrency - 1)` — not raw `workerCount`. With `workerCount=100` on a 16-core machine, using raw `workerCount` made `15 < 100` almost always true, bypassing ring-buffer back-pressure for the entire load (not just tail-end as intended). `effectiveCapacity ≈ 15` makes the burst fire only when the pipeline is actually empty.
+
+When `pipelineDry`, the engine uses `fetchSlots` (ignores `ringSlots`). Network cap (`maxFetches`) still applies. Ring buffer handles any landing-time overflow via LRU eviction; deferred queue (256 slots) absorbs the rest. See [[Back-Pressure Invariants]] for the new invariant.
+
 ---
 
 ## Constraints
@@ -214,7 +262,6 @@ updateCamera()
 ## Open questions
 
 - [ ] How to handle HTTP 206 vs 200 responses from origins that ignore range headers?
-- [ ] Step 7 (future): retune worker count independently of fetch concurrency now that the two are decoupled.
 
 ---
 

@@ -128,6 +128,8 @@ function decodeChunk(req: {
       throw new Error('Worker not initialised — decode called before init completed')
     }
 
+    const t0 = performance.now()
+
     // Step 1: Copy compressed bytes into WASM heap
     //
     // The bytes arrived as a Transferable ArrayBuffer — we now own them
@@ -150,9 +152,23 @@ function decodeChunk(req: {
     decoder.open(req.pointDataRecordFormat, req.pointDataRecordLength, compressedPtr)
 
     // Step 3: Decode all points — first pass collects raw coords for bbox
+    //
+    // PDRFs with per-point RGB (uint16 per channel, scale >> 8 to uint8):
+    //   PDRF 2        → RGB at byte offset 20
+    //   PDRF 3, 5     → RGB at byte offset 28
+    //   PDRF 7, 8, 10 → RGB at byte offset 30
+    // All other PDRFs fall back to elevation coloring.
+    const pdrf = req.pointDataRecordFormat
+    const hasRgb = pdrf === 2 || pdrf === 3 || pdrf === 5
+      || pdrf === 7 || pdrf === 8 || pdrf === 10
+    const rgbByteOffset = pdrf === 2 ? 20 : (pdrf === 3 || pdrf === 5) ? 28 : 30
+
     const rawX = new Float64Array(req.pointCount)
     const rawY = new Float64Array(req.pointCount)
     const rawZ = new Float64Array(req.pointCount)
+    const rawR = hasRgb ? new Uint8Array(req.pointCount) : null
+    const rawG = hasRgb ? new Uint8Array(req.pointCount) : null
+    const rawB = hasRgb ? new Uint8Array(req.pointCount) : null
 
     let minX = Infinity,  minY = Infinity,  minZ = Infinity
     let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity
@@ -176,6 +192,14 @@ function decodeChunk(req: {
       if (wx < minX) minX = wx; if (wx > maxX) maxX = wx
       if (wy < minY) minY = wy; if (wy > maxY) maxY = wy
       if (wz < minZ) minZ = wz; if (wz > maxZ) maxZ = wz
+
+      if (hasRgb) {
+        // HEAPU16 reads uint16 (2 bytes); >> 1 converts byte offset to uint16 index.
+        // LAS RGB is uint16 full-scale; >> 8 converts to uint8.
+        rawR![i] = Module.HEAPU16[(pointPtr + rgbByteOffset    ) >> 1] >> 8
+        rawG![i] = Module.HEAPU16[(pointPtr + rgbByteOffset + 2) >> 1] >> 8
+        rawB![i] = Module.HEAPU16[(pointPtr + rgbByteOffset + 4) >> 1] >> 8
+      }
     }
 
     // Step 4: Quantize to Int16 per-chunk-local coords
@@ -194,16 +218,25 @@ function decodeChunk(req: {
       positions[i * 3 + 1] = Math.round(((rawY[i] - minY) / rangeY) * 65535 - 32768)
       positions[i * 3 + 2] = Math.round(((rawZ[i] - minZ) / rangeZ) * 65535 - 32768)
 
-      const t = (rawZ[i] - req.globalMinZ) / globalRangeZ
-      const rgb = elevationToRgb(t)
-      colors[i * 4]     = rgb[0]
-      colors[i * 4 + 1] = rgb[1]
-      colors[i * 4 + 2] = rgb[2]
-      colors[i * 4 + 3] = 255
+      if (hasRgb) {
+        colors[i * 4]     = rawR![i]
+        colors[i * 4 + 1] = rawG![i]
+        colors[i * 4 + 2] = rawB![i]
+        colors[i * 4 + 3] = 255
+      } else {
+        const t = (rawZ[i] - req.globalMinZ) / globalRangeZ
+        const rgb = elevationToRgb(t)
+        colors[i * 4]     = rgb[0]
+        colors[i * 4 + 1] = rgb[1]
+        colors[i * 4 + 2] = rgb[2]
+        colors[i * 4 + 3] = 255
+      }
     }
 
+    const decodeMs = performance.now() - t0
+
     // Step 5: Transfer decoded buffers to main thread — zero-copy
-    self.postMessage(
+    ;(self as unknown as Worker).postMessage(
       {
         type: 'decoded',
         chunkIndex: req.chunkIndex,
@@ -211,6 +244,7 @@ function decodeChunk(req: {
         pointCount: req.pointCount,
         minX, minY, minZ,
         maxX, maxY, maxZ,
+        decodeMs,
       },
       [positions.buffer, colors.buffer]
     )

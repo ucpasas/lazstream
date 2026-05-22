@@ -103,7 +103,18 @@ The hand-port of `ArithmeticDecoder` + `ArithmeticModel` + `IntegerCompressor` w
 
 - [ ] How to handle LAZ 1.4 files where the chunk table VLR is missing (malformed files)?
 - [ ] Should the manifest loader expose a streaming API so the streaming engine can start before the full chunk table is available?
-- [ ] LAZ 1.2/1.3 seed offset: `seedByteOffset = 0` assumed correct but untested.
+- [x] LAZ 1.2/1.3 seed offset: `seedByteOffset = 0` **verified 2026-05-22** against `cloud-garden.laz` (terrestrial PDRF 2 RGB, 1952 chunks, 97M pts). Seeds load correctly; RGB decode working.
+
+---
+
+## `.lazm.json` multi-tile manifest (2026-05-23)
+
+`src/engine/manifest-loader.ts` and `src/engine/manifest-types.ts` were added to support `.lazm.json` multi-tile manifests. See [[Manifest Session]] for the coordinator that consumes them.
+
+- `urlToManifest(lazUrl)` — wraps a bare `.laz` URL in a synthetic one-tile manifest so there is exactly one load path for both single-file and multi-tile use
+- `fetchManifest(url, signal?)` — fetches and parses a `.lazm.json` file; uses `cache: 'no-store'`
+- `parseManifest(raw)` — validates the JSON structure; throws `ManifestParseError` on any violation
+- `validateManifestUrl(raw)` — added to `url-validator.ts`; same scheme/IP rules as `validateSourceUrl` but expects `.lazm.json` extension
 
 ---
 
@@ -114,3 +125,5 @@ The hand-port of `ArithmeticDecoder` + `ArithmeticModel` + `IntegerCompressor` w
 - [[HTTP/2 Range Requests]] — probe-with-range fix for R2 compatibility
 - [[Streaming Engine]] — consumes `ChunkDescriptor[]`
 - [[LidarScout Chunk-Seed]] — seed points emitted as part of manifest loading
+- [[Manifest Session]] — multi-tile coordinator built on top of manifest loading
+- [[Manifest Format]] — `.lazm.json` spec

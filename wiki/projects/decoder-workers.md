@@ -2,7 +2,7 @@
 title: Decoder Workers
 type: project
 status: active
-updated: 2026-05-18
+updated: 2026-05-22
 tags: [wasm, laz-perf, workers, decode, pdrf, quantization, transferable]
 ---
 
@@ -10,7 +10,7 @@ tags: [wasm, laz-perf, workers, decode, pdrf, quantization, transferable]
 
 Third stage: `[[Manifest Loader]] → [[Streaming Engine]] → Decoder Workers → [[Renderer]]`.
 
-A pool of Web Workers, each hosting a laz-perf WASM instance. Workers **self-fetch** compressed chunk bytes via HTTP Range request, decode them, quantize XYZ to Int16, and transfer the decoded buffers back to the main thread zero-copy via Transferable ArrayBuffers.
+A pool of Web Workers, each hosting a laz-perf WASM instance. The main thread fetches compressed chunk bytes via HTTP Range request and **transfers** them to an idle worker. Workers are pure WASM decoders — no network I/O. Each worker decodes, quantizes XYZ to Int16, and transfers results back zero-copy via Transferable ArrayBuffers.
 
 **Phase 2 Track A is complete.** 380 chunks, 18,991,962 points decoded across 4 workers at 76 fps (validation renderer).
 
@@ -22,7 +22,7 @@ A pool of Web Workers, each hosting a laz-perf WASM instance. Workers **self-fet
 |------|---------|
 | `src/workers/decode-worker.ts` | Web Worker module: init lifecycle, fetch, WASM decode, quantize, transfer |
 | `src/decode/worker-pool.ts` | Main thread: spawns workers, dispatches chunks, routes results, dedup tracking |
-| `src/decode/chunk-priority.ts` | Ranks chunks by inverse-distance to camera; produces sorted dispatch order |
+| `src/decode/chunk-priority.ts` | Ranks undecoded chunks by SSE (screen-space error), frustum-gated; produces sorted dispatch order |
 | `public/lib/laz-perf-worker.js` | Patched laz-perf WASM JS glue (ESM-patched vendor file — see [[laz-perf Worker Porting]]) |
 | `public/lib/laz-perf-worker.wasm` | laz-perf WASM binary (worker build) |
 
@@ -36,13 +36,13 @@ The engine fetches compressed chunk bytes on the main thread (via coalesced rang
 
 **Why Option B:** Enables [[HTTP/2 Range Requests]] coalescing. To coalesce adjacent chunks into one range request, the fetcher must see all pending chunks at once — impossible if each worker fetches independently. Moving fetch to the main thread centralises the coalesce decision, decouples fetch concurrency from decode concurrency, and eliminates the HTTP/1.1 connection-limit constraint on worker count.
 
-### Worker count cap: 32
+### Worker count cap: 100
 
 ```typescript
-Math.min(32, Math.max(1, navigator.hardwareConcurrency - 1))
+Math.min(100, Math.max(1, navigator.hardwareConcurrency - 1))
 ```
 
-Workers are now pure WASM decoders — no network I/O. The connection-limit rationale for capping at 4 no longer applies. 32 is a generous ceiling for CPU parallelism; in practice most machines saturate at `hardwareConcurrency - 1`.
+Workers are pure WASM decoders — no network I/O. The connection-limit rationale for capping at 4 no longer applies. 100 is a high ceiling; in practice machines saturate at `hardwareConcurrency - 1`. Configurable via `?workerCount=N`.
 
 ### laz-perf loading: dynamic import from `public/lib/`
 
@@ -85,7 +85,7 @@ main thread → { type: 'decode', chunkIndex, compressedBytes, pointCount,
    worker → loop: decoder.getPoint(pointPtr) → read HEAP32 → apply scale+offset
    worker → quantize XYZ → Int16, compute elevation color → Uint8 (using globalMinZ/maxZ)
    worker → self.postMessage({ positions, colors, ... }, [positions.buffer, colors.buffer])
-main thread ← { type: 'decoded', chunkIndex, positions, colors, pointCount, min/max XYZ }
+main thread ← { type: 'decoded', chunkIndex, positions, colors, pointCount, min/max XYZ, decodeMs }
 ```
 
 `compressedBytes` is transferred (zero-copy Transferable) — the ArrayBuffer is detached on the main-thread side after `postMessage`.
@@ -149,13 +149,21 @@ pool.configure(header, lazVlr)
 
 ## ChunkPrioritiser
 
-`src/decode/chunk-priority.ts` ranks chunks by inverse distance to camera (Phase 2). Phase 3+ will upgrade to screen-space error (SSE):
+`src/decode/chunk-priority.ts` ranks chunks by **screen-space error (SSE)** — Phase 3 Track C.
 
 ```
-SSE = (geometricError × canvasHeight) / (distance × 2 × tan(fov/2))
+SSE = (chunkExtent × canvasHeight) / (distance × 2 × tan(fovY/2))
 ```
 
-The `prioritise(cameraWorldX, cameraWorldY, cameraWorldZ, maxResults, excludeDecoded)` method returns chunks sorted highest-priority-first. Camera position is in world coordinates; the prioritiser converts to scene-relative coordinates internally using the scene centre established at seed point load time.
+Chunks below `MIN_SSE_THRESHOLD` (default 50.0, tunable via `?sseMin=N`) are excluded entirely — seed point is the correct representation at that zoom level. Above the threshold, chunks are sorted SSE-descending and the top `slots` are dispatched per `updateCamera()` tick.
+
+```typescript
+// Engine calls:
+prioritiser.prioritise(frustumBBox: BBox3D, camera: CameraInfo, maxResults: number)
+// Returns PrioritisedChunk[] — { chunkIndex, sse }, sorted sse descending
+```
+
+Camera and frustum are provided by the renderer via registered providers (Track C); `updateCamera()` is argless. The prioritiser queries `SpatialIndex.queryFrustum()` for the initial visible set, then scores each visible undecoded chunk by SSE.
 
 ---
 
@@ -164,17 +172,17 @@ The `prioritise(cameraWorldX, cameraWorldY, cameraWorldZ, maxResults, excludeDec
 | PDRF | Version | Decode path | Notes |
 |------|---------|-------------|-------|
 | 0–5  | 1.2/1.3 | Standard | No selective layer decode |
-| 6–10 | 1.4 | Standard (layered decode planned Phase 3) | Layered decode not yet used |
+| 6–10 | 1.4 | Standard | laz-perf decodes all bytes; worker reads only needed offsets (XYZ, RGB) |
 
-Layered decode (XYZ-only mode skipping colour/classification layers) is planned for Phase 3 as a performance optimization.
+Selective layer decode (XYZ-only mode bypassing laz-perf colour/classification layers) is not implemented. laz-perf 0.0.7 does not expose a layered API. The worker already reads only the byte offsets it needs from the fully-decoded point record — no laz-perf API change is required for per-attribute selection.
 
 ---
 
 ## Worker count vs fetch concurrency (Phase 3 Track A)
 
 With Option B, worker count and fetch concurrency are independent:
-- **Worker count** = CPU/WASM decode parallelism. Cap: `Math.min(32, hardwareConcurrency - 1)`.
-- **Fetch concurrency** = `maxFetches = workerCount × 2` concurrent main-thread range requests.
+- **Worker count** = CPU/WASM decode parallelism. Cap: `Math.min(100, hardwareConcurrency - 1)`.
+- **Fetch concurrency** = `maxFetches = min(workerCount × 4, 128)` concurrent main-thread range requests. Configurable via `?maxFetches=N`.
 
 The engine's `fetching: Set<number>` tracks in-flight fetches. A chunk is claimed in `fetching` synchronously before any `await` in `updateCamera()`, preventing duplicate dispatches on concurrent frame ticks.
 
@@ -231,10 +239,52 @@ const t = (rawZ[i] - req.globalMinZ) / globalRangeZ
 
 ---
 
+## Pipeline timing instrumentation (2026-05-20)
+
+`decodeMs` field added to `DecodedChunk` (and the `decoded` worker message). The worker records `performance.now()` at the start of `decodeChunk()` and includes the elapsed ms in the postMessage. The renderer accumulates and logs every 25 chunks:
+
+```
+[lazstream/timing] last 25 chunks — decode avg 56.4 ms  pack avg 0.54 ms
+```
+
+**Observed (Melbourne PDRF 6, ~75K pts/chunk, 15 workers):** decode ≈ 56 ms/chunk, pack ≈ 0.5 ms/chunk. With 15 workers: effective decode throughput ~266 chunks/sec → 134 chunks (10M pts) decodes in ~500ms. The 10–11 second loads observed are network-bound (40MB compressed at ~3–5 MB/s to R2), not GPU-bound. See [[COPC vs Raw LAZ]] for architecture context.
+
+---
+
+## Per-point RGB color reading (2026-05-20)
+
+For PDRFs that carry per-point RGB, the decoded bytes are already in the WASM heap after each `decoder.getPoint()` call. The decode worker now reads them directly via `Module.HEAPU16` (uint16 per channel, right-shifted 8 bits to uint8):
+
+| PDRF | Version | RGB byte offset | Notes |
+|------|---------|-----------------|-------|
+| 2    | 1.2     | 20              | No GPS time; RGB follows point source ID |
+| 3    | 1.2     | 28              | GPS time (8 bytes) precedes RGB |
+| 5    | 1.2     | 28              | PDRF 3 + waveform; same RGB offset as PDRF 3 |
+| 7    | 1.4     | 30              | PDRF 6 (30 bytes) + RGB |
+| 8    | 1.4     | 30              | PDRF 7 + NIR (2 bytes after RGB) |
+| 10   | 1.4     | 30              | PDRF 7 + waveform; same RGB offset as PDRF 7 |
+
+All other PDRFs (0, 1, 4, 6, 9) fall back to elevation coloring.
+
+**Reading pattern** (in `decode-worker.ts`):
+```typescript
+rawR[i] = Module.HEAPU16[(pointPtr + rgbByteOffset    ) >> 1] >> 8
+rawG[i] = Module.HEAPU16[(pointPtr + rgbByteOffset + 2) >> 1] >> 8
+rawB[i] = Module.HEAPU16[(pointPtr + rgbByteOffset + 4) >> 1] >> 8
+```
+
+`>> 1` converts byte offset to Uint16Array index; `>> 8` scales LAS full-range uint16 to uint8.
+
+RGB is collected in the first pass (alongside XYZ bounding box) and applied in the second pass (quantization + color packing). No second decode required.
+
+No C++ or laz-perf changes needed — laz-perf already decoded these bytes.
+
+---
+
 ## Open questions
 
-- [ ] Layered decode (PDRF 6-10): implement XYZ-only skip for initial load pass (Phase 3)
-- [ ] Fork laz-perf on GitHub — currently using locally built copy; fork needed for reproducibility
+- [x] **Read actual PDRF 7/8/10 RGB colors** — **Shipped 2026-05-20.** laz-perf decodes all bytes; decode-worker now reads RGB from the WASM heap during the first decode pass and uses it instead of elevation coloring for PDRFs 2/3/5/7/8/10. See RGB byte offsets section below.
+- [x] Fork laz-perf — **local fork exists at `/home/kisar/src/laz-perf`** (clone of `hobuinc/laz-perf`, two local modifications: `js/wasm.sh` calls the patch script post-build; `js/patch-worker-esm.py` applies the two ESM patches). Still needs pushing as a public GitHub fork for reproducibility, but the build is locally reproducible.
 
 ---
 

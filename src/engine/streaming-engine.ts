@@ -41,7 +41,7 @@
  * pattern — engine stays renderer-agnostic.
  */
 
-import type { LasHeader, LazVlr, ChunkTableEntry, SeedPoint } from '../types/las.js'
+import type { LasHeader, ChunkTableEntry, SeedPoint } from '../types/las.js'
 import type { BBox3D } from '../types/spatial.js'
 import { classifyLazVersion, getLazVersionWarning } from '../types/las.js'
 import { validateSourceUrl } from '../network/url-validator.js'
@@ -106,7 +106,6 @@ export class StreamingEngine {
   private spatial = new SpatialIndex()
   private chunks: ChunkTableEntry[] = []
   private header: LasHeader | null = null
-  private lazVlr: LazVlr | null = null
   private url = ''
   private decodedPointCount = 0
   private decodedChunkCount = 0
@@ -121,8 +120,7 @@ export class StreamingEngine {
   private cache: ChunkCache | null = null
 
   private workerCount: number
-  private maxQueuedChunks = 16
-
+  private readonly sseThreshold: number | undefined
   /**
    * True once workerPool.init() AND workerPool.configure() have both returned.
    * Guards updateCamera() / decodeAll(). (Phase 3 Track A — Step 1.)
@@ -146,15 +144,17 @@ export class StreamingEngine {
    */
   private maxFetches: number
 
-  constructor(events: EngineEvents = {}, workerCount?: number, cache?: ChunkCache) {
+  constructor(events: EngineEvents = {}, workerCount?: number, cache?: ChunkCache, sseThreshold?: number, maxFetches?: number) {
     this.events = events
-    this.workerCount = workerCount ?? Math.min(32, Math.max(1, navigator.hardwareConcurrency - 1))
-    this.maxFetches = this.workerCount * 2
+    this.workerCount = workerCount ?? Math.min(100, Math.max(1, navigator.hardwareConcurrency - 1))
+    this.maxFetches  = maxFetches  ?? Math.min(this.workerCount * 4, 128)
     this.cache = cache ?? null
+    this.sseThreshold = sseThreshold
     console.debug('[lazstream] StreamingEngine:', {
       workerCount: this.workerCount,
       maxFetches: this.maxFetches,
       cacheEnabled: this.cache !== null,
+      sseThreshold: this.sseThreshold ?? '(default)',
     })
   }
 
@@ -178,6 +178,14 @@ export class StreamingEngine {
     this.ringBufferProvider = provider
   }
 
+  /** Called by the renderer when a chunk is proactively evicted from the GPU
+   *  ring buffer (invisible for more than EVICT_GRACE_FRAMES). Removes it from
+   *  the decoded set so the engine will re-fetch it when it re-enters view. */
+  onChunkEvictedFromGPU(chunkIndex: number): void {
+    this.prioritiser?.removeDecoded(chunkIndex)
+    this.workerPool?.markEvicted(chunkIndex)
+  }
+
   // ─── Main pipeline ─────────────────────────────────────────────────────
 
   async load(rawUrl: string): Promise<void> {
@@ -192,7 +200,6 @@ export class StreamingEngine {
     this.prioritiser = null
     this.chunks = []
     this.header = null
-    this.lazVlr = null
     this.url = ''
     this.decodedPointCount = 0
     this.decodedChunkCount = 0
@@ -225,7 +232,6 @@ export class StreamingEngine {
       this.emit('header', 'Reading file header...')
       const { header, lazVlr } = await fetchAndParseLasHeader(this.url, signal)
       this.header = header
-      this.lazVlr = lazVlr
 
       const lazVersion = classifyLazVersion(header, lazVlr)
       const warning = getLazVersionWarning(lazVersion)
@@ -314,7 +320,21 @@ export class StreamingEngine {
     }
 
     const fetchSlots = this.maxFetches - this.fetching.size
-    const slots = Math.min(ringSlots, fetchSlots)
+
+    // Tail-end burst: when the decode pipeline is running dry (fewer chunks
+    // in flight than effective CPU capacity), skip the ring-buffer cap and
+    // use the full remaining fetch capacity. Chunks that land and can't fit
+    // go to the deferred queue (safe). Prevents workers going idle while the
+    // engine waits for ringSlots to open one tick at a time.
+    //
+    // Use effective CPU capacity (min of configured workers vs hardware
+    // concurrency) — not raw workerCount. With workerCount=100 on a 16-core
+    // machine, the raw threshold fires almost always (15 < 100), bypassing
+    // ring-buffer back-pressure for the entire load.
+    const effectiveCapacity = Math.min(this.workerCount, Math.max(1, navigator.hardwareConcurrency - 1))
+    const pipelineDry =
+      (this.workerPool.queueLength + this.workerPool.activeCount) < effectiveCapacity
+    const slots = pipelineDry ? fetchSlots : Math.min(ringSlots, fetchSlots)
     if (slots <= 0) return
 
     const camera = this.cameraInfoProvider()
@@ -365,6 +385,9 @@ export class StreamingEngine {
     if (candidates.length === 0) return
     void this.dispatchCandidates(candidates)
   }
+
+  /** Number of chunks in this file's chunk table. Available after load() passes the chunk-table stage. */
+  get chunkCount(): number { return this.chunks.length }
 
   getSceneCenter(): { x: number; y: number; z: number } | null {
     return null
@@ -478,8 +501,17 @@ export class StreamingEngine {
 
     try {
       // batch.end is exclusive; Range header wants inclusive.
+      const fetchT0 = performance.now()
       const buffer = await fetchRange(url, batch.start, batch.end - 1, signal)
+      const fetchMs = performance.now() - fetchT0
       if (signal.aborted) return
+
+      const batchMB = (batch.end - batch.start) / 1048576
+      console.debug(
+        `[lazstream/timing] fetch ${batch.chunks.length} chunks ` +
+        `${batchMB.toFixed(2)} MB in ${fetchMs.toFixed(0)} ms ` +
+        `(${(batchMB * 1000 / fetchMs).toFixed(1)} MB/s)`
+      )
 
       for (const c of batch.chunks) {
         const localOffset = c.chunk.offset - batch.start
@@ -527,7 +559,7 @@ export class StreamingEngine {
     }))
 
     this.spatial.buildFromSeeds(seedXYZ, fileBBox)
-    this.prioritiser = new ChunkPrioritiser(this.spatial)
+    this.prioritiser = new ChunkPrioritiser(this.spatial, this.sseThreshold)
   }
 
   private handleChunkDecoded(chunk: DecodedChunk): void {

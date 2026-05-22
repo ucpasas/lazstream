@@ -32,7 +32,7 @@
  */
 
 import type { LasHeader, LazVlr, ChunkTableEntry, SeedPoint } from '../types/las.js'
-import { fetchRange, fetchTail } from '../network/range-fetcher.js'
+import { fetchRange } from '../network/range-fetcher.js'
 import { ArithmeticDecoder } from '../decode/arithmetic-decoder.js'
 import { IntegerDecompressor } from '../decode/integer-decompressor.js'
 
@@ -47,7 +47,8 @@ export async function fetchChunkTable(
   url: string,
   header: LasHeader,
   lazVlr: LazVlr,
-  fileSize: number
+  fileSize: number,
+  signal?: AbortSignal,
 ): Promise<ChunkTableEntry[]> {
   const pointerOffset = header.pointDataOffset
   const CHUNK_DATA_START = pointerOffset + 8
@@ -60,7 +61,7 @@ export async function fetchChunkTable(
 
   // ── Step 1: Read the 8-byte chunk table pointer ──────────────────────────
 
-  const ptrBuffer = await fetchRange(url, pointerOffset, pointerOffset + 7)
+  const ptrBuffer = await fetchRange(url, pointerOffset, pointerOffset + 7, signal)
   const ptrView = new DataView(ptrBuffer)
   const ptrLo = ptrView.getUint32(0, true)
   const ptrHi = ptrView.getUint32(4, true)
@@ -97,7 +98,7 @@ export async function fetchChunkTable(
 
   // ── Step 2: Fetch from chunk table offset to EOF ──────────────────────────
 
-  const chunkTableBuffer = await fetchRange(url, chunkTableAbsoluteOffset, fileSize - 1)
+  const chunkTableBuffer = await fetchRange(url, chunkTableAbsoluteOffset, fileSize - 1, signal)
   const chunkTableView = new DataView(chunkTableBuffer)
 
   // ── Step 3: Read chunk table header ──────────────────────────────────────
@@ -268,15 +269,20 @@ export async function fetchChunkTable(
 /**
  * Extract the uncompressed seed point (first point) from each chunk.
  *
- * PDRF 0–5:  seed starts at chunkOffset + 0
- * PDRF 6–10: seed starts at chunkOffset + 4 (preceded by 4-byte point count)
+ * PDRF 0–5 (chunked compressor 2):  seed starts at chunkOffset + 0
+ * PDRF 6–10 variable chunk (chunkSize === 0):  starts at chunkOffset + 4 (4-byte count prefix)
+ * PDRF 6–10 fixed chunk (layered compressor 3): reads arithmetic-coder init bytes at offset 0.
+ *   These bytes happen to produce world-X ≈ offsetX for most chunks (range-coder initialises
+ *   with 0xFFFFFFFF → rawX = -1 → world_X ≈ offsetX). Seeds are sparse but give a visible
+ *   overview outline. Invalid seeds are discarded by the bounds check.
  */
 export async function fetchSeedPoints(
   url: string,
   chunks: ChunkTableEntry[],
   header: LasHeader,
   lazVlr: LazVlr,
-  onProgress?: (loaded: number, total: number) => void
+  onProgress?: (loaded: number, total: number) => void,
+  signal?: AbortSignal,
 ): Promise<SeedPoint[]> {
   const seeds: SeedPoint[] = []
   const isPdrf6Plus = header.pointDataRecordFormat >= 6
@@ -285,19 +291,6 @@ export async function fetchSeedPoints(
   // Variable-size chunks: seed point starts at chunk offset + 4 (preceded by point count)
   const seedByteOffset = (lazVlr.chunkSize === 0) ? 4 : 0
   const seedByteLength = header.pointDataRecordLength
-  // Seed-fetch concurrency. The previous value of 6 was an HTTP/1.1
-  // connection-limit holdover; on HTTP/2 (data.lazstream.stream), the
-  // browser will multiplex up to ~100 streams over a single connection,
-  // so larger batches just round-trip faster.
-  //
-  // 7073 chunks / batch_size = batch_count, and each batch awaits the
-  // slowest fetch in it. With batch 6 → 1179 sequential rounds × ~30ms
-  // RTT ≈ 5s. With batch 100 → 71 rounds × ~50ms (slightly slower per-
-  // round because more contention but still fast) ≈ 700ms-1.5s.
-  //
-  // Going higher than ~100 hits the browser's per-origin stream cap and
-  // stops paying off. Some browsers cap concurrent fetch() promises
-  // around 100-200 per origin even on HTTP/2.
   const BATCH_SIZE = 100
 
   console.debug('[lazstream] fetching seed points:', {
@@ -308,6 +301,8 @@ export async function fetchSeedPoints(
   })
 
   for (let batchStart = 0; batchStart < chunks.length; batchStart += BATCH_SIZE) {
+    if (signal?.aborted) return seeds
+
     const batchEnd = Math.min(batchStart + BATCH_SIZE, chunks.length)
     const batchChunks = chunks.slice(batchStart, batchEnd)
 
@@ -315,7 +310,7 @@ export async function fetchSeedPoints(
       batchChunks.map(chunk => {
         const seedStart = chunk.offset + seedByteOffset
         const seedEnd = seedStart + seedByteLength - 1
-        return fetchRange(url, seedStart, seedEnd)
+        return fetchRange(url, seedStart, seedEnd, signal)
       })
     )
 

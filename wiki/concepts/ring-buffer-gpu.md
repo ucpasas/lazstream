@@ -2,13 +2,13 @@
 title: Ring Buffer GPU Memory
 type: concept
 status: active
-updated: 2026-05-13
-tags: [webgpu, gpu-memory, ring-buffer, lru, eviction]
+updated: 2026-05-22
+tags: [webgpu, gpu-memory, ring-buffer, lru, eviction, free-list, fragmentation]
 ---
 
 # Ring Buffer GPU Memory
 
-lazstream manages GPU point cloud memory as a 256 MB ring buffer with LRU eviction, avoiding the overhead of repeated GPU buffer allocation and deallocation as chunks are streamed in and out.
+lazstream manages GPU point cloud memory as a single pre-allocated `GPUBuffer` with a CPU-side free-list allocator and LRU eviction, avoiding the overhead of repeated GPU buffer allocation and deallocation as chunks are streamed in and out.
 
 ---
 
@@ -23,16 +23,16 @@ A single pre-allocated ring buffer amortises this cost: all chunks share one lar
 ## Layout
 
 ```
-GPUBuffer (256 MB, usage: STORAGE | COPY_DST)
-┌──────────┬──────────┬──────────┬───────────────────────┐
-│ chunk 0  │ chunk 1  │ chunk 2  │  ...free/evicted...   │
-│ 0 MB     │ 0.5 MB   │ 1.1 MB   │                       │
-└──────────┴──────────┴──────────┴───────────────────────┘
+GPUBuffer (up to 2 GB, usage: STORAGE | COPY_DST)
+┌──────────┬────────┬───────────┬──────────┬────── ... ─┐
+│ chunk A  │  free  │  chunk B  │  chunk C │    free    │
+│ 600 KB   │ 200 KB │  120 KB   │  600 KB  │            │
+└──────────┴────────┴───────────┴──────────┴────── ... ─┘
+  ▲ byteOffset tracked per slot (variable); not derived from an index
 ```
 
-- Chunks are variable-size (point count × bytes per point).
-- The ring pointer advances monotonically; wraps when it reaches 256 MB.
-- On wrap, the oldest slots (lowest pointer values) are evicted.
+Chunks are variable-size (pointCount × 12 B/pt, 4-byte aligned). Each chunk
+receives exactly the bytes it needs — no tail waste.
 
 ---
 
@@ -43,43 +43,58 @@ Pure TypeScript, no WebGPU types. Fully unit-testable in isolation.
 ```typescript
 interface Slot {
   chunkIndex: number       // LAZ chunk index; -1 for seed pseudo-chunk
-  byteOffset: number       // byte offset into the GPU buffer
-  byteLength: number       // bytes occupied
+  byteOffset: number       // byte offset into the GPU buffer (variable per slot)
+  byteLength: number       // actual data bytes — no padding, no tail waste
   pointCount: number
   min: [number, number, number]    // world-space dequantization origin
   range: [number, number, number]  // world-space dequantization range
-  lastRenderedFrame: number        // -1 if never rendered
+  lastRenderedFrame: number        // initialised to currentFrame-1 (not -1; see below)
+  everRendered: boolean            // set to true on first touch(); guards phantom chunk re-queue
 }
 ```
 
-`RingBufferAllocator` methods: `allocate()`, `touch()`, `getSlot()`, `remove()`, `getSlots()`, `bytesUsed()`, `pointsLoaded()`.
+**`lastRenderedFrame` initialised to `currentFrame - 1`**: a slot placed by `flushDeferredChunks` after the render pass would have `lastRenderedFrame = -1`, which is always below the eviction threshold — it would evict immediately on the next frame, causing an infinite decode/evict loop. Starting at `currentFrame - 1` grants the slot the full `EVICT_GRACE_FRAMES` window before it can be proactively evicted.
+
+**`everRendered`**: distinguishes phantom chunks (pass AABB dispatch, fail exact 6-plane renderer test — `touch()` never called) from legitimately-visible chunks that moved off-screen. Used by `evictInvisibleSlots()` to decide whether to re-queue via `chunkEvictedCallback` — phantoms are released silently.
+
+`RingBufferAllocator` methods: `allocate()`, `touch()`, `getSlot()`, `remove()`, `getSlots()`, `bytesUsed()`, `pointsLoaded()`, `avgChunkBytes()`, `getAvailableCount()`, `metrics()`.
 
 ---
 
-## Eviction algorithm (first-fit + LRU)
+## Allocation algorithm (free-list + defrag-by-eviction)
 
 `allocate()` runs a loop:
-1. `findFirstFreeRange(byteLength)` — walks slots sorted by `byteOffset`, finds first gap ≥ requested size.
-2. If found: insert new slot, sort by offset, return.
-3. If not found: `findLRUEvictable(currentFrame)` — find slot with lowest `lastRenderedFrame` that is **not** visible this frame (`lastRenderedFrame < currentFrame`).
-4. Remove victim, loop back to step 1.
-5. If no evictable slots (all visible): return `null` — caller drops the chunk silently.
+1. **First-fit scan** — walks `freeList` (sorted by offset, coalesced) for the first gap ≥ `byteLength`.
+2. If found: carve `byteLength` bytes from the gap's start, create slot, return success.
+3. If not found: **defrag-by-eviction** — find slot with lowest `lastRenderedFrame` that is **not** visible this frame.
+4. If no evictable slot (all visible): return `{ slot: null, evicted }` — caller pushes to deferred queue.
+5. Evict the LRU slot: remove it from `slots`, add its bytes to `freeList`, coalesce adjacent regions.
+6. Loop back to step 1 — the coalesced gap may now be large enough.
+
+`AllocateResult.evicted` is populated with all evictions that occurred, even if `slot` is ultimately null (defrag ran out of evictable slots before forming a large enough gap). Callers **must** process `evicted` in both the success and failure cases — this clears the three sets required by Invariant 7 ([[Back-Pressure Invariants]] §7).
 
 Frame-coherence invariant: `lastRenderedFrame >= currentFrame` → protected from eviction. The renderer calls `touch(chunkIndex, currentFrame)` for every slot it dispatches each frame.
-
-**Known v1 limitation:** first-fit allocation fragments over time. If visible slots are scattered, a large new chunk may be refused even when total free bytes exceed its size. GPU-side compaction deferred to Track B v2.
 
 ---
 
 ## Fragmentation
 
-Variable-size chunks cause external fragmentation over time. Mitigation:
+Variable-size chunks cause external fragmentation over time. In practice:
 
-- Prefer allocating at the ring pointer position (sequential) rather than filling holes.
-- Periodic compaction (GPU-side buffer copy) if fragmentation > 20% of total capacity.
-- Alternative: fixed-size slots (max chunk size padded). Simpler, wastes memory for small chunks.
+- **Raw LAZ**: all chunks in a file have the same declared point count (`lazVlr.chunkSize`). Eviction always frees a gap matching the size of the next incoming chunk → `firstFit` succeeds immediately → zero defrag evictions in normal operation.
+- **COPC / variable-chunk files**: nodes vary in size. Adjacent small-node gaps coalesce into one large gap that fits a large node. Defrag evictions may occur but are rare.
 
-Current decision: sequential ring with no compaction (revisit if fragmentation is observed in practice).
+`metrics().fragmentationRatio = (bytesFree - largestFreeGap) / bytesFree`. Monitor for high values combined with frequent defrag evictions. If persistent, consider a buddy allocator or (see below) GPU compaction.
+
+---
+
+## GPU compaction — decision: deferred
+
+Full compaction via `copyBufferToBuffer` would require **two ring buffers of equal size** (2× GPU memory) because same-buffer copies with overlapping ranges are a WebGPU validation error, and chunks typically move by less than their own size during compaction (= overlapping ranges in the common case).
+
+At the current 2 GB ring buffer target, a second 2 GB staging buffer would push total GPU storage to 4+ GB — refused by most adapters. Additionally, after compaction, every moved slot's `pointStrideOffset` in the `chunkUniform` array must be updated, and the depth bind group must be rebuilt.
+
+The IDB cache neutralises the cost of defrag eviction: re-decoding an evicted chunk is ~56 ms WASM (zero network bytes). Compaction can be revisited if telemetry shows unacceptable eviction churn.
 
 ---
 
@@ -103,9 +118,21 @@ The shader indexes into it via `chunk.pointStrideOffset` (byte offset / 4, store
 
 ---
 
+## `getAvailableCount()` — back-pressure denominator
+
+The engine's `setRingBufferProvider()` reads `slotsFree` to throttle dispatch. With variable-size slots, "slot count" is meaningless; `getAvailableCount()` instead returns an estimate:
+
+```
+(evictableBytes + totalFreeBytes) / avgChunkBytes()
+```
+
+**Self-tuning average**: `avgChunkBytes()` is a running average of actual allocation sizes. Cold-start fallback: `DEFAULT_MAX_CHUNK_BYTES = 800 KB`. For raw LAZ (all chunks same size), this converges to the exact chunk size within 2–3 allocations.
+
+The estimate is conservative (underestimates for small-chunk files) which is safe — the deferred queue and proactive eviction absorb any estimation error.
+
 ## Open questions
 
-- [ ] Fragmentation: monitor in practice with large files (Melbourne 2018, 7000 chunks). Add compaction if refusals observed.
+- [ ] Monitor `metrics().fragmentationRatio` and defrag eviction count in production. If high for real-world COPC workloads, evaluate buddy allocator (bounded internal fragmentation, no compaction needed).
 
 ---
 
@@ -205,8 +232,8 @@ Flows through to `createWebGPUContext(canvas, { targetCapacityBytes: options.rin
 
 ### Caveats at high slot counts
 
-- **Per-frame CPU encoding cost** scales linearly with slot count. At ~3000 slots, the per-slot `setBindGroup + dispatchWorkgroups` loop takes ~15 ms — close to the 16.7 ms frame budget. Symptoms: `requestAnimationFrame handler took 72ms` violation warnings during slot churn.
-- **Deferred queue overflow** is more frequent. Default `MAX_DEFERRED_CHUNKS=64` was calibrated for 374-slot operation; at 3000 slots, fast camera movement can drop 250+ chunks. Bump to 256 for large buffers.
+- **Per-frame CPU encoding cost** — resolved by 2D mega-dispatch (2026-05-20). One `setBindGroup + dispatchWorkgroups` per frame regardless of slot count.
+- **Deferred queue overflow** is more frequent at high slot counts. `MAX_DEFERRED_CHUNKS` raised to 256 (was 64 at 374-slot calibration); absorbs most fast-pan drop cascades at 3000+ slots.
 - **Memory pressure**: 2 GB ring buffer + 512 MB IDB cache + ~150 MB workers + JS heap ≈ 3 GB+ total. Integrated GPUs or memory-constrained tabs may struggle.
 
 For higher buffer sizes without hitting these caveats, see Phase 5 indirect dispatch in [[Back-Pressure Invariants]].

@@ -86,11 +86,11 @@ Frame N+1:
 
 ## Deferred queue
 
-When `allocate()` returns `null` (truly no evictable slot — all currently visible), `addDecodedChunk()` pushes to a `deferredQueue: DecodedChunk[]` capped at `MAX_DEFERRED_CHUNKS` (default 64; recommend 256 at 2 GB buffer sizes).
+When `allocate()` returns `null` (truly no evictable slot — all currently visible), `addDecodedChunk()` pushes to a `deferredQueue: DecodedChunk[]` capped at `MAX_DEFERRED_CHUNKS` (current value: 256).
 
 On the next frame, if any slot becomes evictable, the oldest deferred chunk is retried. This absorbs momentary full-buffer conditions during fast camera movement without dropping chunks.
 
-At 3000+ slots (2 GB buffer), fast camera movement can generate 250+ dropped chunks in one observation. Bumping `MAX_DEFERRED_CHUNKS` to 256 absorbs most cases.
+At 3000+ slots (2 GB buffer), fast camera movement can generate 250+ dropped chunks in one observation. 256 absorbs most cases; was raised from 64 (the 374-slot calibration) once large-buffer operation was confirmed.
 
 ---
 
@@ -102,12 +102,41 @@ This is the intended behaviour: the seed overview is always-resident. To make se
 
 ---
 
+## Proactive eviction (2026-05-20)
+
+Slots are freed eagerly rather than only under allocation pressure.
+
+```typescript
+// After cull+touch, before flushDeferredChunks — every frame:
+private evictInvisibleSlots(): void {
+  const threshold = this.currentFrame - EVICT_GRACE_FRAMES  // 5 frames
+  for (const slot of this.slots.getSlots()) {
+    if (slot.chunkIndex === SEED_PSEUDO_CHUNK_INDEX) continue  // seeds never evicted
+    if (slot.lastRenderedFrame < threshold) {
+      this.releaseSlot(slot.chunkIndex)
+      if (slot.everRendered) this.chunkEvictedCallback?.(slot.chunkIndex)
+    }
+  }
+}
+```
+
+**Invariant 5 — Proactive eviction grace:** A slot touched `EVICT_GRACE_FRAMES` or fewer frames ago is not proactively evicted. This absorbs fast pans without churning chunks that briefly leave and re-enter the frustum.
+
+**Invariant 6 — Phantom chunk silence:** `chunkEvictedCallback` is only called when `slot.everRendered === true`. Phantom chunks (pass AABB cull, fail exact 6-plane renderer test) are silently released without re-queueing. Calling the callback for phantoms causes an infinite oscillation: evict → engine re-queues → decode → same frustum failure → repeat.
+
+**Invariant 7 — Three-set clearance on eviction:** GPU eviction must remove the chunk from three independent sets: `RingBufferAllocator` (slot freed), `ChunkPrioritiser.decoded` (re-enables for re-queuing), and `WorkerPool.completed` (clears `isKnown()` check). Missing any one permanently orphans the chunk — it can never be re-fetched in the current session.
+
+**Invariant 8 — Deferred drop parity:** A chunk dropped from `deferredChunks` due to capacity overflow must also call `chunkEvictedCallback` (when `everRendered` applies). Deferred chunks are in `prioritiser.decoded` and `workerPool.completed` but never in a GPU slot — GPU eviction never reaches them, so the drop path is the only opportunity to clear them.
+
+---
+
 ## Summary of invariants
 
 1. **Touch before eviction check**: `renderFrame()` calls `touch()` for every slot it dispatches, in the same frame as the budget check. No slot rendered this frame can be evicted this frame.
 2. **In-flight subtraction**: The engine subtracts `fetching + queue + active` from `slotsFree` before dispatching. A "free" slot isn't truly available if a chunk is mid-flight to fill it.
 3. **`isKnown()` before fetch**: `WorkerPool.isKnown(chunkIndex)` covers completed + inFlight + queued. The engine checks this before adding to `fetching`, preventing both re-fetches and re-queues.
 4. **Synchronous claim**: Engine claims chunks in `this.fetching` synchronously before the first `await` in `dispatchCandidates()`. Concurrent `updateCamera()` calls in subsequent frames see these chunks as taken.
+9. **Pipeline-dry override**: When `(queueLength + activeCount) < effectiveCapacity` (workers about to go idle), the engine ignores `ringSlots` and uses `fetchSlots` directly. `ringSlots` is over-conservative at tail-end — in-flight work makes the buffer appear committed when it isn't yet. Ring buffer LRU eviction and the deferred queue absorb any landing-time overflow safely. `effectiveCapacity = min(workerCount, hardwareConcurrency - 1)` — using raw `workerCount` (e.g. 100) on a 16-core machine caused this to fire on every tick, defeating the Step-6 cascade fix for the entire load.
 
 ---
 
