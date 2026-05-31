@@ -1,11 +1,11 @@
 # Dependencies
 node_modules/
-pnpm-lock.yaml
-pnpm-workspace.yaml
 
 # Build output
 dist/
+dist-app/
 dist-ssr/
+*.tgz
 
 # TypeScript
 *.tsbuildinfo
@@ -15,8 +15,8 @@ dist-ssr/
 .env.*
 !.env.example
 
-# Claude Code local settings (project settings.json is tracked)
-.claude/settings.local.json
+# Claude Code settings — both local and project kept off remote
+.claude/
 
 # OS
 .DS_Store
@@ -30,3 +30,7 @@ Thumbs.db
 
 # Obsidian local settings
 wiki/.obsidian/
+
+# Internal development artifacts — kept local only
+wiki/
+CLAUDE.md

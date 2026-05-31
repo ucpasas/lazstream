@@ -1,0 +1,47 @@
+{
+  "name": "@lazstream/viewer",
+  "version": "1.0.0",
+  "description": "One-liner WebGPU point cloud viewer for LAZ files",
+  "type": "module",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types":  "./dist/index.d.ts"
+    }
+  },
+  "main":  "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "sideEffects": false,
+  "files": ["dist"],
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": ["lidar", "las", "laz", "point-cloud", "webgpu", "streaming", "copc", "geospatial"],
+  "homepage": "https://lazstream.stream",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ucpasas/lazstream.git",
+    "directory": "packages/viewer"
+  },
+  "license": "Apache-2.0",
+  "author": "ucpasas <kisar.samsuya@gmail.com>",
+  "scripts": {
+    "dev":       "vite",
+    "build":     "vite build --mode lib",
+    "build:app": "vite build",
+    "check":     "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@lazstream/core": "^1.0.0",
+    "three": ">=0.168.0"
+  },
+  "devDependencies": {
+    "@lazstream/core": "workspace:*",
+    "@types/three": "^0.168.0",
+    "@webgpu/types": "^0.1.69",
+    "three": "^0.168.0",
+    "typescript": "^5.5.0",
+    "vite": "^6.0.0",
+    "vite-plugin-dts": "^4.0.0"
+  }
+}
