@@ -1,0 +1,52 @@
+name: Deploy
+
+# Runs on every push to main — keeps the live demo in sync with the codebase.
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Build and deploy to GitHub Pages
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write  # Required to push to the gh-pages branch
+
+    steps:
+      - name: Checkout
+        # actions/checkout@v4 — pinned to commit SHA
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Setup pnpm
+        # pnpm/action-setup@v4 — pinned to commit SHA
+        uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa
+        with:
+          version: 11
+
+      - name: Setup Node
+        # actions/setup-node@v4 — pinned to commit SHA
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build app
+        # build:app produces dist-app/ (full viewer app, not the npm library).
+        # The CNAME file in public/ is copied automatically by Vite.
+        run: pnpm --filter @lazstream/viewer build:app
+
+      - name: Deploy to gh-pages
+        # peaceiris/actions-gh-pages@v4 — pinned to commit SHA
+        uses: peaceiris/actions-gh-pages@329bcc8f12caed2cefe5a5b80781499a6f3b361b
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: packages/viewer/dist-app
+          # Keeps the gh-pages branch history clean — one commit per deploy.
+          force_orphan: true

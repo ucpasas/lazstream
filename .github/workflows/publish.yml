@@ -1,0 +1,69 @@
+name: Publish
+
+# Triggers only on version tags pushed from the protected main branch.
+on:
+  push:
+    tags:
+      - 'v*'
+
+# Minimum permissions at workflow level.
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish to npm (OIDC — no stored token)
+    runs-on: ubuntu-latest
+
+    # Named environment — allows adding a manual approval gate in GitHub
+    # settings if needed. No secrets stored here.
+    environment: npm
+
+    permissions:
+      contents: read
+      # GitHub generates a short-lived OIDC token proving this is publish.yml
+      # in ucpasas/lazstream. pnpm publish --provenance presents it to npm,
+      # which verifies it against GitHub's OIDC provider. No NPM_TOKEN needed.
+      id-token: write
+
+    steps:
+      - name: Checkout
+        # actions/checkout@v4 — pinned to commit SHA
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Setup pnpm
+        # pnpm/action-setup@v4 — pinned to commit SHA
+        uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa
+        with:
+          version: 11
+
+      - name: Setup Node
+        # actions/setup-node@v4 — pinned to commit SHA
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Audit dependencies
+        run: pnpm audit --audit-level=high
+
+      - name: Build
+        run: pnpm -r build
+
+      - name: Typecheck
+        run: pnpm -r check
+
+      # Publish core first — viewer declares core as a peer dependency.
+      # --provenance: OIDC token authenticates the publish AND attaches a
+      #   Sigstore attestation linking the package to this exact commit and run.
+      # --no-git-checks: CI checkout is always clean; these checks are redundant.
+      - name: Publish @lazstream/core
+        run: pnpm publish --provenance --no-git-checks
+        working-directory: packages/core
+
+      - name: Publish @lazstream/viewer
+        run: pnpm publish --provenance --no-git-checks
+        working-directory: packages/viewer

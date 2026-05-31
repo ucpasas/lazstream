@@ -1,0 +1,39 @@
+{
+  "name": "@lazstream/core",
+  "version": "1.0.0",
+  "description": "Browser-native LAZ streaming engine — no preprocessing required",
+  "type": "module",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types":  "./dist/index.d.ts"
+    }
+  },
+  "sideEffects": false,
+  "files": ["dist"],
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": ["lidar", "las", "laz", "point-cloud", "webgpu", "streaming", "copc", "geospatial"],
+  "homepage": "https://lazstream.stream",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ucpasas/lazstream.git",
+    "directory": "packages/core"
+  },
+  "license": "Apache-2.0",
+  "author": "ucpasas <kisar.samsuya@gmail.com>",
+  "scripts": {
+    "build": "vite build",
+    "check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "idb-keyval": "^6.2.2",
+    "rbush-3d": "^0.0.4"
+  },
+  "devDependencies": {
+    "vite": "^6.0.0",
+    "typescript": "^5.5.0",
+    "vite-plugin-dts": "^4.0.0"
+  }
+}
