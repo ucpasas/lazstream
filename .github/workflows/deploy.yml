@@ -24,8 +24,6 @@ jobs:
       - name: Setup pnpm
         # pnpm/action-setup@v4 — pinned to commit SHA
         uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa
-        with:
-          version: 11
 
       - name: Setup Node
         # actions/setup-node@v4 — pinned to commit SHA
