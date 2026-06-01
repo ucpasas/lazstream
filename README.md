@@ -4,21 +4,22 @@ Browser-native LAZ point cloud streaming. Load any LAZ 1.2–1.4 file directly f
 
 [Live demo](https://lazstream.stream) · [npm: @lazstream/core](https://www.npmjs.com/package/@lazstream/core) · [npm: @lazstream/viewer](https://www.npmjs.com/package/@lazstream/viewer)
 
+![lazstream — garden scan, 118M points](docs/screenshot.png)
+*[Cloud Garden](https://xyz.cct.lsu.edu/cloud-garden/) — LSU Center for Computation & Technology*
+
 ---
 
 ## What it does
 
-lazstream streams compressed LAZ point clouds from cloud storage and renders them in the browser using WebGPU compute shaders. It handles files of any size — a 2.93 GB aerial survey with 353 million points renders at 60 fps by keeping only what the camera can see in GPU memory at any given moment.
+Most point cloud viewers make you preprocess your data first — convert LAZ to COPC, run a tile server, wait for indexing. lazstream skips all of that. Give it a public or pre-signed URL on S3, R2, or Azure Blob and your point cloud is interactive in the browser in seconds, straight from the original file.
 
-The pipeline:
+The key insight comes from the LAZ format itself: every LAZ file contains a chunk table — a list of byte offsets, one per block of ~50,000 points. By fetching the first raw (uncompressed) point from each block, lazstream builds a sparse overview of the entire file, before decompressing anything. This is the chunk-seed technique from [LidarScout (Erler et al., HPG 2025)](https://doi.org/10.2312/hpg.20251170), adapted for the browser.
+
+From there, full chunks stream in on demand. Each chunk is fetched with an HTTP range request, decoded in a laz-perf WASM worker, and handed to a WebGPU compute shader that depth-tests every visible point — across all loaded chunks simultaneously — in a single GPU dispatch using `atomicMin`. A fixed-size ring buffer (~2 GB by default) holds only what the camera can currently see; chunks evict as you pan away and reload when you return.
 
 ```
 HTTP range request  →  laz-perf WASM decoder  →  GPU ring buffer  →  WebGPU atomicMin render  →  EDL resolve
 ```
-
-**Instant overview.** One seed point per chunk is fetched upfront — a representative sample of the entire file. This appears in under a second. Full-resolution chunks stream in as you navigate.
-
-**Scales to any file size.** The ring buffer is fixed (default ~2 GB). Chunks stream in and out as the camera moves; only what is currently visible occupies GPU memory.
 
 ---
 
@@ -88,6 +89,20 @@ Point clouds have no surface normals. lazstream uses Eye-Dome Lighting (Boucheny
 
 ---
 
+## Limitations
+
+**WebGPU required.** `@lazstream/viewer` uses WebGPU compute shaders and has no WebGL fallback. Chrome 113+, Edge 113+, and Safari 18+ work out of the box. Firefox requires enabling `dom.workers.modules.enabled` in `about:config`. A WebGL fallback is planned but not yet implemented.
+
+**First loads are network-bound.** A 40 MB compressed LAZ file at a typical 3–5 MB/s throughput takes 10–11 seconds to fully decode. This is inherent to raw LAZ — the entire file must be transferred because there is no spatial hierarchy to skip parts of it. IDB caching (on by default) makes all subsequent views of the same file instant.
+
+**Binary LOD only.** Raw LAZ files store points in scan order, not spatial order. Each chunk is either a single seed point (the overview) or all 50 000–75 000 of its points (full resolution). There is no intermediate level of detail. Zooming in immediately loads full chunks. Files converted to COPC would support continuous progressive refinement, but lazstream currently cannot render COPC files (see below).
+
+**COPC files do not render.** COPC uses LAZ 1.4 layered compression (compressor type 3), which is not supported by laz-perf 0.0.7. A COPC file will load — the header and chunk table parse correctly — but chunk decode fails silently and no points appear. Upgrading laz-perf and adding COPC hierarchy traversal are Phase 5 work items.
+
+**No GPU device-lost recovery.** If the WebGPU context is lost — typically from a sleep/wake cycle, driver crash, or the tab being backgrounded on mobile — a page reload is required. Automatic recovery is not yet implemented.
+
+---
+
 ## Browser support
 
 | Browser | Status |
@@ -111,6 +126,22 @@ lazstream/
 ├── LICENSE        Apache-2.0
 └── README.md
 ```
+
+---
+
+## Credits
+
+**Techniques**
+
+- **WebGPU atomicMin point rendering** — [Markus Schütz](https://github.com/m-schuetz) (TU Wien). lazstream's compute-shader depth pass is an implementation of his technique for lock-free per-pixel depth competition across millions of points in a single compute dispatch.
+- **Eye-Dome Lighting** — Boucheny (2009), 4-cardinal-neighbour log-depth variant as implemented by [Potree](https://github.com/potree/potree). The resolve pass in lazstream follows the same formulation.
+- **Chunk-seed instant overview** — Erler, Schütz, Wimmer. *LidarScout: Direct Out-of-Core Rendering of Massive Point Clouds.* HPG 2025. [doi:10.2312/hpg.20251170](https://doi.org/10.2312/hpg.20251170)
+
+**Libraries**
+
+- **[laz-perf](https://github.com/connormanning/laz-perf)** — Connor Manning / hobu Inc. The WASM LAZ decoder lazstream runs in every decode worker.
+- **[Three.js](https://threejs.org)** — camera, OrbitControls, and frustum math in `@lazstream/viewer`. Not used for rendering points.
+- **[rbush](https://github.com/mourner/rbush) / [rbush-3d](https://github.com/nicktindall/rbush-3d)** — Vladimir Agafonkin's R-tree (2D), adapted to 3D. The spatial index backing chunk prioritisation and frustum culling in `@lazstream/core`.
 
 ---
 

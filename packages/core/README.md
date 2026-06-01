@@ -437,6 +437,14 @@ makeCacheKey(url, chunkIndex)  // build a cache key manually if needed
 
 ---
 
+## Credits
+
+- **[laz-perf](https://github.com/connormanning/laz-perf)** — Connor Manning / hobu Inc. The WASM LAZ decoder that runs inside each decode worker.
+- **[rbush](https://github.com/mourner/rbush) / [rbush-3d](https://github.com/nicktindall/rbush-3d)** — Vladimir Agafonkin's R-tree, adapted to 3D. Powers the spatial index and frustum culling in `@lazstream/core`.
+- **Chunk-seed overview** — Erler, Schütz, Wimmer. *LidarScout: Direct Out-of-Core Rendering of Massive Point Clouds.* HPG 2025. [doi:10.2312/hpg.20251170](https://doi.org/10.2312/hpg.20251170)
+
+---
+
 ## License
 
 Apache-2.0 — see [LICENSE](../../LICENSE).
