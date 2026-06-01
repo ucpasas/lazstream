@@ -243,8 +243,7 @@ export class ManifestSession {
           agg.readyTiles.add(tileIndex)
           const n = agg.readyTiles.size
           if (n === tileCount) {
-            const totalChunks = this.engines.reduce((s, e) => s + (e?.chunkCount ?? 0), 0)
-            outer.onStateChange?.('ready', `All ${tileCount} tiles loaded — ${totalChunks} chunks decoded`)
+            outer.onStateChange?.('ready', tileCount > 1 ? `${tileCount} tiles loaded` : 'Ready')
           } else {
             outer.onStateChange?.('streaming', `${n}/${tileCount} tiles ready`)
           }

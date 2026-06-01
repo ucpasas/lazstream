@@ -521,10 +521,7 @@ export class StreamingEngine {
     )
 
     if (this.decodedChunkCount >= this.chunks.length) {
-      this.emit('ready',
-        `All ${this.chunks.length} chunks decoded — ` +
-        `${this.decodedPointCount.toLocaleString()} points`
-      )
+      this.emit('ready', 'Ready')
     }
   }
 
