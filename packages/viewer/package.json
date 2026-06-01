@@ -1,6 +1,6 @@
 {
   "name": "@lazstream/viewer",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "One-liner WebGPU point cloud viewer for LAZ files",
   "type": "module",
   "exports": {
