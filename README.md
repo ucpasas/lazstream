@@ -23,6 +23,26 @@ HTTP range request  →  laz-perf WASM decoder  →  GPU ring buffer  →  WebGP
 
 ---
 
+## Use cases
+
+### What it's for
+
+**Viewing raw LAZ files from cloud storage without preprocessing.** Drop an S3, R2, or Azure Blob URL into lazstream and the file is interactive in the browser. No COPC conversion, no tile server, no second copy of your data.
+
+**Sharing an exact view with other people.** The share button encodes the source URL and camera position into a URL fragment (`#v=…`). Anyone with the link lands at the same viewpoint instantly — no account, no installation, nothing to install.
+
+**Building a custom LAZ renderer on a solid streaming engine.** `@lazstream/core` is renderer-agnostic: it handles the network layer, LAZ decoding, spatial index, and IDB caching with no dependency on Three.js or WebGPU. Wire the three provider callbacks to your own renderer — Three.js, Babylon.js, deck.gl, or a bare WebGPU pipeline.
+
+### What it's not
+
+**A replacement for preprocessed formats.** COPC and Potree are significantly more efficient: an octree hierarchy means only the chunks you're looking at are fetched. For a 10 M-point scene lazstream transfers ~40 MB; an equivalent COPC file transfers 8–15 MB. If you control the pipeline and can afford the conversion step, you should use it. lazstream is for files you can't or don't want to preprocess.
+
+**A point cloud editor.** The source file is strictly read-only — lazstream streams and renders, it never writes to, modifies, or re-uploads the LAZ file.
+
+**A viewer for uncompressed LAS files.** Plain `.las` files are rejected with an error. Only compressed LAZ 1.2–1.4 is supported. If your file isn't compressed, run it through `laszip` first.
+
+---
+
 ## Packages
 
 | Package | Description |
@@ -59,6 +79,20 @@ Most point cloud tools require converting LAZ files to a specialised format (COP
 
 Every network call is a standard HTTP/2 range request. There is no backend, no WebSocket, and no custom protocol. Point lazstream at any public or pre-signed URL on S3, R2, or Azure Blob.
 
+### CORS setup
+
+lazstream runs entirely in the browser and fetches files directly from their origin. Your storage bucket must allow cross-origin requests with the following response headers:
+
+```
+Access-Control-Allow-Origin: https://your-viewer.example.com
+Access-Control-Allow-Headers: Range
+Access-Control-Expose-Headers: Content-Range, Content-Length
+```
+
+`Access-Control-Allow-Headers: Range` is required — browsers send it as a preflight on range requests. `Access-Control-Expose-Headers: Content-Range` is required to read the file size; without it the browser hides the header and lazstream cannot determine the file's total byte length.
+
+All major providers (S3, R2, Azure Blob, GCS) support this in their bucket CORS settings.
+
 ### Aggressive culling — how large files stay fast
 
 lazstream applies four culling stages in sequence. Each stage eliminates chunks before they consume bandwidth or GPU memory:
@@ -93,7 +127,7 @@ Point clouds have no surface normals. lazstream uses Eye-Dome Lighting (Boucheny
 
 **WebGPU required.** `@lazstream/viewer` uses WebGPU compute shaders and has no WebGL fallback. Chrome 113+, Edge 113+, and Safari 18+ work out of the box. Firefox requires enabling `dom.workers.modules.enabled` in `about:config`. A WebGL fallback is planned but not yet implemented.
 
-**First loads are network-bound.** A 40 MB compressed LAZ file at a typical 3–5 MB/s throughput takes 10–11 seconds to fully decode. This is inherent to raw LAZ — the entire file must be transferred because there is no spatial hierarchy to skip parts of it. IDB caching (on by default) makes all subsequent views of the same file instant.
+**First loads are network-bound.** Chunks stream in as HTTP range requests — only what the camera frames is fetched. But raw LAZ has no spatial hierarchy, so fully exploring a file means every chunk is eventually requested. A 40 MB file at 3–5 MB/s takes 10–11 seconds of total transfer time once all chunks have been visited. IDB caching (on by default) makes all subsequent views of the same file instant.
 
 **Binary LOD only.** Raw LAZ files store points in scan order, not spatial order. Each chunk is either a single seed point (the overview) or all 50 000–75 000 of its points (full resolution). There is no intermediate level of detail. Zooming in immediately loads full chunks. Files converted to COPC would support continuous progressive refinement, but lazstream currently cannot render COPC files (see below).
 
