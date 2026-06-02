@@ -14,6 +14,20 @@ export class NetworkError extends Error {
   }
 }
 
+export class CorsError extends Error {
+  constructor(
+    public readonly url?: string,
+    reason: 'blocked' | 'expose-headers' = 'blocked'
+  ) {
+    super(
+      reason === 'expose-headers'
+        ? 'Server does not expose Content-Range — add Access-Control-Expose-Headers: Content-Range, Content-Length to the bucket CORS config'
+        : 'Could not reach file — CORS headers are missing. The server must send Access-Control-Allow-Origin and Access-Control-Allow-Headers: Range'
+    )
+    this.name = 'CorsError'
+  }
+}
+
 /**
  * Fetch a specific byte range from a URL.
  * Returns the raw ArrayBuffer for that range.
@@ -24,14 +38,20 @@ export async function fetchRange(
   end: number,
   signal?: AbortSignal,
 ): Promise<ArrayBuffer> {
-  const response = await fetch(url, {
-    headers: {
-      // Inclusive range: bytes=start-end fetches end-start+1 bytes
-      Range: `bytes=${start}-${end}`,
-    },
-    cache: 'no-store',
-    signal,
-  })
+  let response: Response
+  try {
+    response = await fetch(url, {
+      headers: {
+        // Inclusive range: bytes=start-end fetches end-start+1 bytes
+        Range: `bytes=${start}-${end}`,
+      },
+      cache: 'no-store',
+      signal,
+    })
+  } catch (err) {
+    if (err instanceof TypeError) throw new CorsError(url)
+    throw err
+  }
 
   if (response.status !== 206 && response.status !== 200) {
     throw new NetworkError(
@@ -77,7 +97,13 @@ export async function probeUrl(url: string, signal?: AbortSignal): Promise<{
   supportsRange: boolean
 }> {
   // Step 1: HEAD request for file size
-  const headResponse = await fetch(url, { method: 'HEAD', cache: 'no-store', signal })
+  let headResponse: Response
+  try {
+    headResponse = await fetch(url, { method: 'HEAD', cache: 'no-store', signal })
+  } catch (err) {
+    if (err instanceof TypeError) throw new CorsError(url)
+    throw err
+  }
 
   if (!headResponse.ok) {
     throw new NetworkError(
@@ -96,25 +122,33 @@ export async function probeUrl(url: string, signal?: AbortSignal): Promise<{
   const acceptRanges = headResponse.headers.get('Accept-Ranges')
   const headerSaysRanges = acceptRanges === 'bytes'
 
-  // Step 2: If header is missing or uncertain, verify with an actual range request
-  // Fetch bytes 0–0 (1 byte) — minimal cost, definitive answer
+  // Step 2: If header is missing or uncertain, verify with an actual range request.
+  // Fetch bytes 0–0 (1 byte) — minimal cost, definitive answer.
+  // Also confirms Content-Range is exposed (required for file size on range responses).
   if (!headerSaysRanges) {
-    const rangeResponse = await fetch(url, {
-      headers: { Range: 'bytes=0-0' },
-      cache: 'no-store',
-      signal,
-    })
+    let rangeResponse: Response
+    try {
+      rangeResponse = await fetch(url, {
+        headers: { Range: 'bytes=0-0' },
+        cache: 'no-store',
+        signal,
+      })
+    } catch (err) {
+      if (err instanceof TypeError) throw new CorsError(url)
+      throw err
+    }
 
     if (rangeResponse.status === 206) {
-      // Server confirmed range support via actual 206 response
-      // Also extract file size from Content-Range if we didn't get it from HEAD
-      // Content-Range format: "bytes 0-0/TOTAL"
       if (fileSize === 0) {
+        // No Content-Length from HEAD — need Content-Range to get file size.
+        // Requires Access-Control-Expose-Headers: Content-Range on the server.
         const contentRange = rangeResponse.headers.get('Content-Range')
-        if (contentRange) {
-          const match = contentRange.match(/\/(\d+)$/)
-          if (match) fileSize = parseInt(match[1], 10)
+        if (!contentRange) {
+          throw new CorsError(url, 'expose-headers')
         }
+        // Content-Range format: "bytes 0-0/TOTAL"
+        const match = contentRange.match(/\/(\d+)$/)
+        if (match) fileSize = parseInt(match[1], 10)
       }
       return { fileSize, supportsRange: true }
     }

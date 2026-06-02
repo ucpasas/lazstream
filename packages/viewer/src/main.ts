@@ -19,7 +19,7 @@
  *                      over ?url= / ?manifest= for auto-load
  */
 
-import { ManifestSession, fetchManifest, urlToManifest, validateManifestUrl, getEntryFromParams, encodeViewState, decodeViewState } from '@lazstream/core'
+import { ManifestSession, fetchManifest, urlToManifest, validateManifestUrl, getEntryFromParams, encodeViewState, decodeViewState, CorsError } from '@lazstream/core'
 import type { ManifestSessionOptions, Manifest, CameraState } from '@lazstream/core'
 import { WebGPURenderer, WebGPUUnsupportedError } from './render/webgpu-renderer.js'
 // ?worker&url: Vite compiles decode-worker.ts as a module worker and returns its
@@ -92,6 +92,26 @@ async function main(): Promise<void> {
       pendingCamState = vs.cam
     } catch {
       console.warn('[lazstream] Invalid #v= token — ignoring')
+    }
+  }
+
+  // ─── Error display ────────────────────────────────────────────────────────
+
+  function displayError(err: unknown): void {
+    const error = err instanceof Error ? err : new Error(String(err))
+    console.error('[lazstream]', error)
+
+    if (error instanceof CorsError) {
+      statusEl.textContent = 'CORS error — file could not be loaded'
+      statusEl.className = 'status status--error'
+      warningEl.textContent =
+        '⚠ CORS headers missing on the hosting server. ' +
+        'Required: Access-Control-Allow-Origin · Access-Control-Allow-Headers: Range · ' +
+        'Access-Control-Expose-Headers: Content-Range, Content-Length'
+      warningEl.style.display = 'block'
+    } else {
+      statusEl.textContent = `Error: ${error.message}`
+      statusEl.className = 'status status--error'
     }
   }
 
@@ -214,8 +234,7 @@ async function main(): Promise<void> {
         },
 
         onError(error) {
-          statusEl.textContent = `Error: ${error.message}`
-          console.error('[lazstream]', error)
+          displayError(error)
         },
       },
       workerCount,
@@ -274,10 +293,7 @@ async function main(): Promise<void> {
         manifest = urlToManifest(rawInput)
       }
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err)
-      statusEl.textContent = `Error: ${message}`
-      statusEl.className = 'status status--error'
-      console.error('[lazstream]', err)
+      displayError(err)
       return
     }
 

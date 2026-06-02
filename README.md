@@ -93,6 +93,8 @@ Access-Control-Expose-Headers: Content-Range, Content-Length
 
 All major providers (S3, R2, Azure Blob, GCS) support this in their bucket CORS settings.
 
+If CORS is misconfigured, lazstream detects it at probe time and surfaces an actionable error message in the viewer UI rather than failing silently.
+
 ### Aggressive culling — how large files stay fast
 
 lazstream applies four culling stages in sequence. Each stage eliminates chunks before they consume bandwidth or GPU memory:
