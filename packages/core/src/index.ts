@@ -44,7 +44,7 @@ export type { CacheMetrics } from './cache/idb-cache.js'
 
 // ── Errors — for instanceof checks in consumer error handlers ────────────────
 export { ParseError } from './engine/header-parser.js'
-export { NetworkError } from './network/range-fetcher.js'
+export { NetworkError, CorsError } from './network/range-fetcher.js'
 export { SecurityError } from './network/url-validator.js'
 export { ChunkTableError } from './engine/chunk-table.js'
 
