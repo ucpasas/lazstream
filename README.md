@@ -107,8 +107,6 @@ lazstream applies four culling stages in sequence. Each stage eliminates chunks 
 
 4. **LRU eviction** — slots not rendered for 5 consecutive frames (~83 ms) are evicted from the GPU ring buffer, immediately freeing space for newly visible chunks. The streaming engine re-fetches evicted chunks if the camera returns to them.
 
-The result: a 353 M-point file on a 2 GB ring buffer (~2 900 slots) renders at 60 fps by keeping only the highest-priority visible chunks in GPU memory at any time.
-
 `sseThreshold` and `ringBufferCapacity` are the two primary controls. See the [configuration reference](packages/core/README.md#configuration) for details.
 
 ### WebGPU compute for point scale
@@ -133,7 +131,7 @@ Point clouds have no surface normals. lazstream uses Eye-Dome Lighting (Boucheny
 
 **Binary LOD only.** Raw LAZ files store points in scan order, not spatial order. Each chunk is either a single seed point (the overview) or all 50 000–75 000 of its points (full resolution). There is no intermediate level of detail. Zooming in immediately loads full chunks. Files converted to COPC would support continuous progressive refinement, but lazstream currently cannot render COPC files (see below).
 
-**COPC files do not render.** COPC uses LAZ 1.4 layered compression (compressor type 3), which is not supported by laz-perf 0.0.7. A COPC file will load — the header and chunk table parse correctly — but chunk decode fails silently and no points appear. Upgrading laz-perf and adding COPC hierarchy traversal are Phase 5 work items.
+**COPC files do not render.** COPC uses LAZ 1.4 layered compression (compressor type 3), which is not supported by laz-perf 0.0.7. A COPC file will load — the header and chunk table parse correctly — but chunk decode fails silently and no points appear. Upgrading laz-perf and adding COPC hierarchy traversal is in the works.
 
 **No GPU device-lost recovery.** If the WebGPU context is lost — typically from a sleep/wake cycle, driver crash, or the tab being backgrounded on mobile — a page reload is required. Automatic recovery is not yet implemented.
 
