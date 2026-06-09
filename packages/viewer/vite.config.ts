@@ -28,6 +28,10 @@ export default defineConfig(({ mode }) => {
         external: ['three', /^three\//, '@lazstream/core'],
       } : undefined,
     },
+    // ?url= in browser query params (e.g. /?url=https://...) matches Vite's
+    // internal /[?&]url\b/ transform regex, triggering a server.fs.allow check
+    // that rejects the request. strict:false disables that check for the dev server.
+    server: { fs: { strict: false } },
     worker: { format: 'es' },
     assetsInclude: ['**/*.wasm', '**/*.wgsl'],
     optimizeDeps: { exclude: ['laz-perf'] },

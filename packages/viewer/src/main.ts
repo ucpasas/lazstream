@@ -77,6 +77,18 @@ async function main(): Promise<void> {
       ? Math.max(1, parseInt(splatRadiusParam, 10))
       : undefined
 
+  // ─── Fetch-timing diagnostic (dev-only, tree-shaken when ?timing absent) ──
+
+  let decodeTimingListener: ((chunk: { chunkIndex: number; decodeMs: number }) => void) | null = null
+
+  if (urlParams.has('timing')) {
+    const { installFetchTimingObserver } = await import('./dev/fetch-timing.js')
+    installFetchTimingObserver({
+      origin: 'https://data.lazstream.stream',
+      onChunkDecoded: (cb) => { decodeTimingListener = cb },
+    })
+  }
+
   // ─── Hash-based view state ────────────────────────────────────────────────
   // #v=<base64url> encodes both the source URL and the camera state.
   // Takes priority over ?url= / ?manifest= for auto-load.
@@ -231,6 +243,7 @@ async function main(): Promise<void> {
 
         onChunkDecoded(chunk) {
           renderer.addDecodedChunk(chunk)
+          decodeTimingListener?.(chunk)
         },
 
         onError(error) {
