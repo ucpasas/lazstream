@@ -1,0 +1,351 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>lazstream — LAZ Point Cloud Viewer</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #0d0d1a;
+      --surface: #1a1a2e;
+      --surface2: #16213e;
+      --accent: #00d4ff;
+      --accent2: #7b2fff;
+      --text: #e8e8f0;
+      --text-muted: #8888a8;
+      --warning: #ffb347;
+      --error: #ff4757;
+      --success: #2ed573;
+      --radius: 6px;
+      --font: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+    }
+
+    html, body {
+      height: 100%;
+      width: 100%;
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font);
+      font-size: 13px;
+      overflow: hidden;
+    }
+
+    /* ── Canvas fills viewport ── */
+    #canvas {
+      position: fixed;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      display: block;
+    }
+
+    /* ── Top bar ── */
+    #toolbar {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      height: 48px;
+      background: rgba(13, 13, 26, 0.85);
+      backdrop-filter: blur(12px);
+      border-bottom: 1px solid rgba(0, 212, 255, 0.15);
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 0 16px;
+      z-index: 100;
+    }
+
+    #logo {
+      font-size: 15px;
+      font-weight: 700;
+      color: var(--accent);
+      letter-spacing: -0.5px;
+      white-space: nowrap;
+    }
+
+    #logo span {
+      color: var(--text-muted);
+      font-weight: 400;
+    }
+
+    #url-input {
+      flex: 1;
+      height: 30px;
+      background: rgba(255,255,255,0.06);
+      border: 1px solid rgba(0,212,255,0.2);
+      border-radius: var(--radius);
+      color: var(--text);
+      font-family: var(--font);
+      font-size: 12px;
+      padding: 0 10px;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+
+    #url-input:focus {
+      border-color: var(--accent);
+    }
+
+    #load-btn {
+      height: 30px;
+      padding: 0 14px;
+      background: var(--accent);
+      color: var(--bg);
+      border: none;
+      border-radius: var(--radius);
+      font-family: var(--font);
+      font-size: 12px;
+      font-weight: 700;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: opacity 0.2s;
+    }
+
+    #load-btn:hover { opacity: 0.85; }
+    #load-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    #share-btn {
+      height: 30px;
+      padding: 0 14px;
+      background: transparent;
+      color: var(--accent);
+      border: 1px solid rgba(0, 212, 255, 0.4);
+      border-radius: var(--radius);
+      font-family: var(--font);
+      font-size: 12px;
+      font-weight: 700;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: background 0.2s, opacity 0.2s;
+    }
+
+    #share-btn:hover:not(:disabled) { background: rgba(0, 212, 255, 0.08); }
+    #share-btn:disabled { opacity: 0.3; cursor: not-allowed; }
+
+    /* ── Status bar (bottom) ── */
+    #statusbar {
+      position: fixed;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      height: 28px;
+      background: rgba(13, 13, 26, 0.85);
+      backdrop-filter: blur(12px);
+      border-top: 1px solid rgba(0, 212, 255, 0.1);
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      padding: 0 16px;
+      z-index: 100;
+    }
+
+    #status {
+      flex: 1;
+      color: var(--text-muted);
+      font-size: 11px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    #status.status--ready { color: var(--success); }
+    #status.status--error { color: var(--error); }
+    #status.status--probing,
+    #status.status--header,
+    #status.status--chunk-table,
+    #status.status--seeds { color: var(--accent); }
+
+    #stats {
+      color: var(--text-muted);
+      font-size: 11px;
+      white-space: nowrap;
+    }
+
+    /* ── Progress bar ── */
+    #progress {
+      position: fixed;
+      top: 48px;
+      left: 0;
+      right: 0;
+      height: 2px;
+      background: rgba(0,212,255,0.15);
+      z-index: 99;
+      display: none;
+    }
+
+    #progress::after {
+      content: '';
+      display: block;
+      height: 100%;
+      width: var(--progress, 0%);
+      background: linear-gradient(90deg, var(--accent2), var(--accent));
+      transition: width 0.2s;
+    }
+
+    /* ── Warning banner ── */
+    #warning {
+      position: fixed;
+      top: 54px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(255, 179, 71, 0.12);
+      border: 1px solid rgba(255, 179, 71, 0.4);
+      color: var(--warning);
+      font-size: 11px;
+      padding: 6px 14px;
+      border-radius: var(--radius);
+      z-index: 98;
+      display: none;
+      max-width: 600px;
+      text-align: center;
+    }
+
+    /* ── Crosshair overlay ── */
+    #crosshair {
+      position: fixed;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      width: 16px;
+      height: 16px;
+      pointer-events: none;
+      opacity: 0.4;
+    }
+
+    #crosshair::before,
+    #crosshair::after {
+      content: '';
+      position: absolute;
+      background: var(--accent);
+    }
+
+    #crosshair::before {
+      width: 1px;
+      height: 100%;
+      left: 50%;
+      top: 0;
+    }
+
+    #crosshair::after {
+      width: 100%;
+      height: 1px;
+      top: 50%;
+      left: 0;
+    }
+
+    /* ── Help text (shown before any file loads) ── */
+    #help {
+      position: fixed;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      text-align: center;
+      color: var(--text-muted);
+      pointer-events: none;
+      transition: opacity 0.5s;
+    }
+
+    #help h2 {
+      font-size: 28px;
+      font-weight: 300;
+      color: var(--text);
+      letter-spacing: -1px;
+      margin-bottom: 8px;
+    }
+
+    #help h2 em {
+      color: var(--accent);
+      font-style: normal;
+    }
+
+    #help p {
+      font-size: 12px;
+      line-height: 1.8;
+    }
+
+    #help.hidden { opacity: 0; }
+
+    /* ── Attribution (bottom-right, shown when manifest provides it) ── */
+    #attribution {
+      position: fixed;
+      bottom: 34px;
+      right: 12px;
+      color: var(--text-muted);
+      font-size: 10px;
+      opacity: 0.7;
+      pointer-events: none;
+      display: none;
+      z-index: 99;
+    }
+  </style>
+  <script type="module" crossorigin src="/assets/index-CsESPTpY.js"></script>
+</head>
+<body>
+
+  <canvas id="canvas"></canvas>
+
+  <!-- Top toolbar -->
+  <div id="toolbar">
+    <div id="logo">laz<span>stream</span></div>
+    <input
+      id="url-input"
+      type="text"
+      placeholder="https://your-storage.example.com/scan.laz"
+      spellcheck="false"
+      autocomplete="off"
+    />
+    <button id="load-btn">Load</button>
+    <button id="share-btn" disabled title="Copy shareable link with current camera position">Share</button>
+  </div>
+
+  <!-- Progress bar -->
+  <div id="progress"></div>
+
+  <!-- Warning banner (LAZ version, CORS issues) -->
+  <div id="warning"></div>
+
+  <!-- Attribution (shown when manifest provides it) -->
+  <div id="attribution"></div>
+
+  <!-- Crosshair -->
+  <div id="crosshair"></div>
+
+  <!-- Help overlay (hidden once loading starts) -->
+  <div id="help">
+    <h2>laz<em>stream</em></h2>
+    <p>
+      Stream LAZ point clouds directly from cloud storage<br>
+      No preprocessing · No conversion · No server
+    </p>
+  </div>
+
+  <!-- Status bar -->
+  <div id="statusbar">
+    <div id="status" class="status--idle">Ready</div>
+    <div id="stats"></div>
+  </div>
+
+
+  <script>
+    // Hide help overlay once loading starts
+    const help = document.getElementById('help')
+    const urlInput = document.getElementById('url-input')
+    const loadBtn = document.getElementById('load-btn')
+
+    function hideHelp() {
+      help.classList.add('hidden')
+      setTimeout(() => help.remove(), 600)
+    }
+
+    loadBtn.addEventListener('click', hideHelp, { once: true })
+    const p = new URLSearchParams(window.location.search)
+    if (p.has('url') || p.has('manifest') || window.location.hash.includes('v=')) {
+      hideHelp()
+    }
+  </script>
+
+</body>
+</html>
