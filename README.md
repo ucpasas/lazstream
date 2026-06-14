@@ -69,6 +69,111 @@ See the [viewer README](packages/viewer/README.md) for the full options referenc
 
 ---
 
+## Point picking
+
+lazstream provides three tiers of click-based point picking. Each tier is opt-in; you only pay for what you activate.
+
+| Tier | What you get | Cost |
+|------|-------------|------|
+| **T1 — world position** | 3D XYZ of the clicked point | ~1 frame async GPU readback |
+| **T2 — point identity** | which chunk + which point within it | ~33 MB VRAM while active (4K viewport) |
+| **T3 — full attributes** | classification, intensity, return number, GPS time, RGB | one chunk decode per click (~5 ms, usually cached) |
+
+T1 and T2 ship together and are enabled by a single call. T3 is a separate option on `LazstreamViewer`.
+
+### Basic picking (T1 + T2)
+
+```typescript
+import { LazstreamViewer } from '@lazstream/viewer'
+
+const viewer = await LazstreamViewer.create(canvas)
+
+// Wire the callback before enabling
+viewer.onPointPicked = (result) => {
+  if (!result) return // click hit empty space
+
+  // T1 — always present on a hit
+  console.log('world position', result.worldPos) // { x, y, z }
+
+  // T2 — present when picking is enabled
+  console.log('chunk', result.chunkIndex, 'point', result.pointIndex)
+}
+
+viewer.setPickingEnabled(true)
+await viewer.load('https://your-bucket.s3.amazonaws.com/scan.laz')
+```
+
+`result` is `null` when the click hits empty space (depth sentinel). `chunkIndex` and `pointIndex` are `undefined` if the pick buffer is disabled.
+
+### Full attribute resolution (T3)
+
+Pass `resolveAttributes: true` to `LazstreamViewer.create`. When a pick resolves to a point identity (T2), the viewer automatically re-decodes that chunk and attaches the full attribute record to the result. The re-decode is fast — the chunk is almost certainly already in the IDB cache.
+
+```typescript
+const viewer = await LazstreamViewer.create(canvas, {
+  resolveAttributes: true,
+})
+
+viewer.onPointPicked = (result) => {
+  if (!result) return
+
+  const a = result.attributes // PointAttributes | undefined
+  if (a) {
+    console.log('classification', a.classification)
+    console.log('intensity',      a.intensity)
+    console.log('return',         `${a.returnNumber} of ${a.numberOfReturns}`)
+    if (a.gpsTime !== undefined) console.log('GPS time', a.gpsTime)
+    if (a.r !== undefined)       console.log('RGB', a.r, a.g, a.b)
+  }
+}
+```
+
+`PointAttributes` fields and their PDRF availability:
+
+| Field | Type | Always present | Notes |
+|-------|------|----------------|-------|
+| `x`, `y`, `z` | `number` | ✓ | World coordinates (scale + offset applied) |
+| `intensity` | `number` | ✓ | Raw uint16 (0–65535) |
+| `classification` | `number` | ✓ | 5-bit class (PDRF 0–5) or full byte (PDRF 6–10) |
+| `returnNumber` | `number` | ✓ | 3-bit (PDRF 0–5) or 4-bit (PDRF 6–10) |
+| `numberOfReturns` | `number` | ✓ | Same encoding |
+| `gpsTime` | `number \| undefined` | PDRFs 1, 3, 5, 6–10 | Seconds of GPS week |
+| `r`, `g`, `b` | `number \| undefined` | PDRFs 2, 3, 5, 7, 8, 10 | 0–255 |
+
+### Using the raw WebGPURenderer
+
+If you're wiring `WebGPURenderer` directly (without the `LazstreamViewer` wrapper), the same T1+T2 API is available on the renderer itself. T3 requires calling `resolvePointAttributes` on your session manually.
+
+```typescript
+import { WebGPURenderer } from '@lazstream/viewer/render/webgpu-renderer'
+import { ManifestSession } from '@lazstream/core'
+
+// ... set up renderer and session ...
+
+renderer.onPointPicked = async (raw) => {
+  if (!raw) return
+
+  // T1
+  console.log('world pos', raw.worldPos)
+
+  // T2
+  if (raw.chunkIndex >= 0) {
+    // T3 — call into core manually
+    const attrs = await session.resolvePointAttributes(raw.chunkIndex, raw.localPointIndex)
+    console.log('attrs', attrs)
+  }
+}
+renderer.setPickingEnabled(true)
+```
+
+### Notes
+
+- **Debounce:** concurrent picks are ignored while one is in flight. The first click always wins; queued picks during `mapAsync` are dropped. This is correct for a "click to identify" tool. If you need continuous hover readout, wire `pointermove` instead and accept occasional misses.
+- **VRAM:** the pick-ID buffer (~33 MB at 4K, ~8 MB at 1080p) is allocated only while `setPickingEnabled(true)` is active. Call `setPickingEnabled(false)` to free it when a non-picking tool is selected.
+- **Multi-tile manifests:** `chunkIndex` is a global index across all tiles. `resolvePointAttributes` routes to the correct tile automatically.
+
+---
+
 ## Design
 
 ### No preprocessing required
