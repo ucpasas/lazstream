@@ -23,7 +23,7 @@
  *   isInFlight() alone misses the queue.
  */
 
-import type { LasHeader, LazVlr, ChunkTableEntry } from '../types/las.js'
+import type { LasHeader, LazVlr, ChunkTableEntry, PointAttributes } from '../types/las.js'
 
 /**
  * Override URLs for lazstream's bundled worker and WASM assets.
@@ -65,10 +65,19 @@ interface PendingRequest {
   compressedBytes: ArrayBuffer    // Held until a worker is free; transferred on dispatch
 }
 
+interface PendingAttrRequest {
+  seqId: number
+  compressedBytes: ArrayBuffer
+  pointIndex: number
+  resolve: (attrs: PointAttributes) => void
+  reject: (err: Error) => void
+}
+
 interface WorkerState {
   worker: Worker
   busy: boolean
   currentChunkIndex: number | null
+  currentAttrSeqId: number | null  // non-null when busy with a decode-attrs request
 }
 
 // ─── Worker Pool ─────────────────────────────────────────────────────────────
@@ -86,6 +95,10 @@ export class WorkerPool {
 
   private inFlight = new Set<number>()
   private completed = new Set<number>()
+
+  private pendingAttrs = new Map<number, { resolve: (v: PointAttributes) => void; reject: (e: Error) => void }>()
+  private attrQueue: PendingAttrRequest[] = []
+  private attrSeq = 0
 
   constructor(events: WorkerPoolEvents = {}, workerCount?: number, assetUrls?: LazstreamAssetUrls) {
     this.events = events
@@ -129,6 +142,7 @@ export class WorkerPool {
           worker,
           busy: false,
           currentChunkIndex: null,
+          currentAttrSeqId: null,
         }
 
         // Set up handler BEFORE posting init message
@@ -156,6 +170,16 @@ export class WorkerPool {
             this.handleError(state, msg)
             return
           }
+
+          if (msg.type === 'point-attrs') {
+            this.handlePointAttrs(state, msg)
+            return
+          }
+
+          if (msg.type === 'point-attrs-error') {
+            this.handlePointAttrsError(state, msg)
+            return
+          }
         }
 
         worker.onerror = (err: ErrorEvent) => {
@@ -169,7 +193,14 @@ export class WorkerPool {
           // WASM module is in an indeterminate state and sending another decode
           // request would trigger a crash loop. The worker sits idle; the engine
           // back-pressure and deferred queue drain work around the lost capacity.
-          if (state.currentChunkIndex !== null) {
+          if (state.currentAttrSeqId !== null) {
+            const pending = this.pendingAttrs.get(state.currentAttrSeqId)
+            if (pending) {
+              this.pendingAttrs.delete(state.currentAttrSeqId)
+              pending.reject(new Error(err.message ?? 'uncaught worker error during attr decode'))
+            }
+            state.currentAttrSeqId = null
+          } else if (state.currentChunkIndex !== null) {
             this.inFlight.delete(state.currentChunkIndex)
             this.events.onWorkerError?.(state.currentChunkIndex, err.message ?? 'uncaught worker error')
           }
@@ -249,10 +280,40 @@ export class WorkerPool {
   get activeCount(): number { return this.inFlight.size }
   get queueLength(): number { return this.queue.length }
 
+  /**
+   * Dispatch a decode-attrs request to an idle worker, or queue it if all are busy.
+   * Returns a Promise that resolves with the decoded PointAttributes.
+   * The compressedBytes buffer is transferred to the worker (detached on return).
+   */
+  requestPointAttributes(
+    compressedBytes: ArrayBuffer,
+    pointIndex: number,
+  ): Promise<PointAttributes> {
+    return new Promise((resolve, reject) => {
+      if (this.disposed) { reject(new Error('WorkerPool disposed')); return }
+      if (!this.header)  { reject(new Error('WorkerPool not configured')); return }
+
+      const seqId = ++this.attrSeq
+      this.pendingAttrs.set(seqId, { resolve, reject })
+
+      const idle = this.workers.find(w => !w.busy)
+      if (idle) {
+        this.dispatchAttr(idle, seqId, compressedBytes, pointIndex)
+      } else {
+        this.attrQueue.push({ seqId, compressedBytes, pointIndex, resolve, reject })
+      }
+    })
+  }
+
   dispose(): void {
     this.disposed = true
     this.queue = []
+    this.attrQueue = []
     this.inFlight.clear()
+    for (const { reject } of this.pendingAttrs.values()) {
+      reject(new Error('WorkerPool disposed'))
+    }
+    this.pendingAttrs.clear()
     for (const state of this.workers) state.worker.terminate()
     this.workers = []
   }
@@ -327,9 +388,79 @@ export class WorkerPool {
   }
 
   private dispatchNext(workerState: WorkerState): void {
-    if (this.disposed || this.queue.length === 0) return
+    if (this.disposed) return
+    // Drain attr requests first — they're rare, user-facing, and should not wait behind a full decode queue
+    if (this.attrQueue.length > 0) {
+      const next = this.attrQueue.shift()!
+      this.dispatchAttr(workerState, next.seqId, next.compressedBytes, next.pointIndex)
+      return
+    }
+    if (this.queue.length === 0) return
     if (!this.header || !this.lazVlr) return
     const next = this.queue.shift()!
     this.dispatch(workerState, next.chunkIndex, next.chunk, next.compressedBytes)
+  }
+
+  private dispatchAttr(
+    workerState: WorkerState,
+    seqId: number,
+    compressedBytes: ArrayBuffer,
+    pointIndex: number,
+  ): void {
+    if (!this.header) return
+    workerState.busy = true
+    workerState.currentChunkIndex = null
+    workerState.currentAttrSeqId = seqId
+
+    workerState.worker.postMessage({
+      type: 'decode-attrs',
+      seqId,
+      compressedBytes,
+      pointIndex,
+      pointDataRecordFormat: this.header.pointDataRecordFormat,
+      pointDataRecordLength: this.header.pointDataRecordLength,
+      scaleX: this.header.scaleX,
+      scaleY: this.header.scaleY,
+      scaleZ: this.header.scaleZ,
+      offsetX: this.header.offsetX,
+      offsetY: this.header.offsetY,
+      offsetZ: this.header.offsetZ,
+    }, [compressedBytes])
+  }
+
+  private handlePointAttrs(workerState: WorkerState, msg: any): void {
+    const seqId = msg.seqId as number
+    workerState.busy = false
+    workerState.currentAttrSeqId = null
+
+    const pending = this.pendingAttrs.get(seqId)
+    if (pending) {
+      this.pendingAttrs.delete(seqId)
+      pending.resolve({
+        x: msg.x, y: msg.y, z: msg.z,
+        intensity: msg.intensity,
+        classification: msg.classification,
+        returnNumber: msg.returnNumber,
+        numberOfReturns: msg.numberOfReturns,
+        gpsTime: msg.gpsTime,
+        r: msg.r, g: msg.g, b: msg.b,
+      })
+    }
+
+    this.dispatchNext(workerState)
+  }
+
+  private handlePointAttrsError(workerState: WorkerState, msg: any): void {
+    const seqId = msg.seqId as number
+    workerState.busy = false
+    workerState.currentAttrSeqId = null
+
+    const pending = this.pendingAttrs.get(seqId)
+    if (pending) {
+      this.pendingAttrs.delete(seqId)
+      pending.reject(new Error(msg.message))
+    }
+
+    this.dispatchNext(workerState)
   }
 }

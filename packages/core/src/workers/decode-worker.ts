@@ -113,6 +113,103 @@ self.onmessage = async (e: MessageEvent) => {
     decodeChunk(msg)
     return
   }
+
+  // ── Decode-attrs: decode a single point and return its raw attributes ─────
+  if (msg.type === 'decode-attrs') {
+    decodePointAttrs(msg)
+    return
+  }
+}
+
+// ─── Single-Point Attribute Decode ───────────────────────────────────────────
+
+function decodePointAttrs(req: {
+  seqId: number
+  compressedBytes: ArrayBuffer
+  pointIndex: number
+  pointDataRecordFormat: number
+  pointDataRecordLength: number
+  scaleX: number; scaleY: number; scaleZ: number
+  offsetX: number; offsetY: number; offsetZ: number
+}): void {
+  try {
+    if (!Module || !decoder) {
+      throw new Error('Worker not initialised — decode-attrs called before init completed')
+    }
+
+    const compressedBytes = new Uint8Array(req.compressedBytes)
+
+    if (compressedBytes.length > compressedAllocSize) {
+      if (compressedPtr !== 0) Module._free(compressedPtr)
+      compressedAllocSize = compressedBytes.length * 2
+      compressedPtr = Module._malloc(compressedAllocSize)
+      if (compressedPtr === 0) throw new Error(`Failed to allocate ${compressedAllocSize} bytes on WASM heap`)
+    }
+    Module.HEAPU8.set(compressedBytes, compressedPtr)
+
+    decoder.open(req.pointDataRecordFormat, req.pointDataRecordLength, compressedPtr)
+
+    // Advance decoder to the target point (inclusive)
+    for (let i = 0; i <= req.pointIndex; i++) {
+      decoder.getPoint(pointPtr)
+    }
+
+    const pdrf = req.pointDataRecordFormat
+    const heap8: Uint8Array = Module.HEAPU8
+
+    // XYZ (int32, bytes 0–11) → world coords
+    const x = Module.HEAP32[(pointPtr >> 2)]     * req.scaleX + req.offsetX
+    const y = Module.HEAP32[(pointPtr >> 2) + 1] * req.scaleY + req.offsetY
+    const z = Module.HEAP32[(pointPtr >> 2) + 2] * req.scaleZ + req.offsetZ
+
+    // Intensity — uint16 at bytes 12–13, all PDRFs
+    const intensity = Module.HEAPU16[(pointPtr + 12) >> 1]
+
+    // Return number + number of returns — byte 14, bit layout differs by PDRF family
+    const byte14 = heap8[pointPtr + 14]
+    const returnNumber    = pdrf <= 5 ? (byte14 & 0x07)        : (byte14 & 0x0F)
+    const numberOfReturns = pdrf <= 5 ? ((byte14 >> 3) & 0x07) : ((byte14 >> 4) & 0x0F)
+
+    // Classification — byte 15 bits 0–4 (PDRF 0–5) or byte 16 full byte (PDRF 6–10)
+    const classification = pdrf <= 5
+      ? (heap8[pointPtr + 15] & 0x1F)
+      : heap8[pointPtr + 16]
+
+    // GPS time — float64, present in PDRFs 1, 3, 5 (offset 20) and 6–10 (offset 22).
+    // Both offsets are misaligned for HEAPF64 (requires 8-byte alignment) so we use DataView.
+    let gpsTime: number | undefined
+    if (pdrf === 1 || pdrf === 3 || pdrf === 5) {
+      gpsTime = new DataView(Module.HEAPU8.buffer).getFloat64(pointPtr + 20, true)
+    } else if (pdrf >= 6) {
+      gpsTime = new DataView(Module.HEAPU8.buffer).getFloat64(pointPtr + 22, true)
+    }
+
+    // RGB — uint16 per channel, >> 8 to uint8. Same offsets as the bulk decode path.
+    const hasRgb = pdrf === 2 || pdrf === 3 || pdrf === 5 || pdrf === 7 || pdrf === 8 || pdrf === 10
+    const rgbByteOffset = pdrf === 2 ? 20 : (pdrf === 3 || pdrf === 5) ? 28 : 30
+    const r = hasRgb ? Module.HEAPU16[(pointPtr + rgbByteOffset    ) >> 1] >> 8 : undefined
+    const g = hasRgb ? Module.HEAPU16[(pointPtr + rgbByteOffset + 2) >> 1] >> 8 : undefined
+    const b = hasRgb ? Module.HEAPU16[(pointPtr + rgbByteOffset + 4) >> 1] >> 8 : undefined
+
+    self.postMessage({
+      type: 'point-attrs',
+      seqId: req.seqId,
+      x, y, z,
+      intensity,
+      classification,
+      returnNumber,
+      numberOfReturns,
+      gpsTime,
+      r, g, b,
+    })
+
+  } catch (err) {
+    self.postMessage({
+      type: 'point-attrs-error',
+      seqId: req.seqId,
+      message: err instanceof Error ? err.message : String(err),
+    })
+  }
 }
 
 // ─── Chunk Decode ────────────────────────────────────────────────────────────

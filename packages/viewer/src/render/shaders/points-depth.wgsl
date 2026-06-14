@@ -31,12 +31,16 @@ struct ChunkUniform {
     pointStrideOffset: u32,   // offset (in u32s) into `points` where this chunk starts
 };
 
-@group(0) @binding(0) var<uniform>            camera:       CameraUniform;
-@group(0) @binding(1) var<storage, read>      chunks:       array<ChunkUniform>;
-@group(0) @binding(2) var<storage, read>      points:       array<u32>;
-@group(0) @binding(3) var<storage, read_write> depthBuffer: array<atomic<u32>>;
-@group(0) @binding(4) var<storage, read_write> colorBuffer: array<u32>;
-@group(0) @binding(5) var<storage, read>      visibleSlots: array<u32>;
+@group(0) @binding(0) var<uniform>             camera:       CameraUniform;
+@group(0) @binding(1) var<storage, read>       chunks:       array<ChunkUniform>;
+@group(0) @binding(2) var<storage, read>       points:       array<u32>;
+@group(0) @binding(3) var<storage, read_write> depthBuffer:  array<atomic<u32>>;
+@group(0) @binding(4) var<storage, read_write> colorBuffer:  array<u32>;
+@group(0) @binding(5) var<storage, read>       visibleSlots: array<u32>;
+// Pick-ID buffer (T2 picking). Inactive = 4-byte stub; OOB writes are silently dropped by WebGPU.
+// Encoding: bits 31..19 = uniformIdx (slot in chunks[]), bits 18..0 = local point index.
+// Sentinel 0xFFFFFFFF = no point (matches depth sentinel).
+@group(0) @binding(6) var<storage, read_write> pickBuffer:   array<u32>;
 
 fn unpackI16(packed: u32, half: u32) -> i32 {
     let raw = (packed >> (half * 16u)) & 0xFFFFu;
@@ -48,8 +52,9 @@ fn unpackI16(packed: u32, half: u32) -> i32 {
 
 @compute @workgroup_size(128)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let chunk    = chunks[visibleSlots[gid.y]];
-    let pointIdx = gid.x;
+    let uniformIdx = visibleSlots[gid.y];
+    let chunk      = chunks[uniformIdx];
+    let pointIdx   = gid.x;
     if (pointIdx >= chunk.pointCount) { return; }
 
     let base = chunk.pointStrideOffset + pointIdx * 3u;
@@ -83,6 +88,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (py >= u32(viewportH)) { return; }
 
     let depthBits = bitcast<u32>(ndc.z);
+    // Encode (uniformIdx, pointIdx) for T2 picking. Same race profile as colorBuffer:
+    // written only in the atomicMin win-branch, benign sub-pixel margin error accepted.
+    let encodedId = (uniformIdx << 19u) | pointIdx;
     let radius = i32(camera.splatRadius) - 1;
     let vpW = i32(viewportW);
     let vpH = i32(viewportH);
@@ -95,6 +103,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let prev = atomicMin(&depthBuffer[idx], depthBits);
             if (depthBits < prev) {
                 colorBuffer[idx] = rgba;
+                pickBuffer[idx]  = encodedId;
             }
         }
     }

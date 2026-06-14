@@ -43,9 +43,14 @@ import {
   packSeedsAsChunk,
   type SeedPoint,
 } from './point-packing'
+import type { RawPick } from './picking'
+export type { RawPick } from './picking'
 import type { DecodedChunk, BBox3D, LasHeader, CameraState } from '@lazstream/core'
 
 // --- Constants ---------------------------------------------------------------
+
+/** Minimum valid GPUBuffer size; used as the pick buffer stub when picking is inactive. */
+const PICK_STUB_SIZE = 4
 
 const SEED_PSEUDO_CHUNK_INDEX = -1
 const SEED_HIDE_THRESHOLD     = Infinity
@@ -110,6 +115,9 @@ export class WebGPURenderer {
   // Buffers — viewport-dependent (recreated on resize)
   private depthBuffer!: GPUBuffer
   private colorBuffer!: GPUBuffer
+  // Pick buffer: viewport-sized u32 array when picking is active; 4-byte stub otherwise.
+  // OOB writes from the depth shader to the stub are silently dropped by WebGPU.
+  private pickBuffer!: GPUBuffer
   private viewportPixels = { w: 0, h: 0 }
 
   // Bind groups (recreated when their backing buffers change)
@@ -122,6 +130,8 @@ export class WebGPURenderer {
   private readonly freeUniformSlotIdxs: number[] // indices 0..MAX_SLOTS-1
   /** Map chunkIndex → uniform slot index (0..MAX_SLOTS-1). */
   private readonly chunkToUniformIdx = new Map<number, number>()
+  /** Reverse map: uniform slot index → chunkIndex. Used to decode pick IDs (T2). */
+  private readonly uniformIdxToChunkIndex = new Map<number, number>()
 
   /**
    * Chunks that arrived from decode but couldn't fit in the ring buffer at the
@@ -203,6 +213,22 @@ export class WebGPURenderer {
   private readonly onFrame?: (info: FrameInfo) => void
   private chunkEvictedCallback: ((chunkIndex: number) => void) | null = null
 
+  // --- Picking (T1 + T2) ---------------------------------------------------
+
+  /** Fires when the user clicks and a pick result is ready. Set to null to opt out. */
+  onPointPicked: ((pick: RawPick | null) => void) | null = null
+
+  /** True while pick-ID buffer maintenance (allocate + write + clear) is active. */
+  private pickEnabled = false
+  /** Debounce: ignore new clicks while a pick is already in flight. */
+  private pickInFlight = false
+  /** Staging buffer for depth readback (T1). 4 bytes, MAP_READ | COPY_DST. */
+  private readonly pickDepthStaging: GPUBuffer
+  /** Staging buffer for pick-ID readback (T2). 4 bytes, MAP_READ | COPY_DST. */
+  private readonly pickIdStaging: GPUBuffer
+  /** Snapshot of inverted viewProj at click time — avoids async-staleness artifacts. */
+  private readonly pickViewProjInverse = new THREE.Matrix4()
+
   // --- Constructor / factory ------------------------------------------------
 
   private constructor(ctx: WebGPUContext, options: WebGPURendererOptions) {
@@ -249,12 +275,24 @@ export class WebGPURenderer {
     this.chunkUniformScratch    = new Float32Array(CHUNK_UNIFORM_BYTES / 4)
     this.visibleSlotListScratch = new Uint32Array(MAX_SLOTS)
 
+    // Pick staging buffers (created once, 4 bytes each)
+    this.pickDepthStaging = this.device.createBuffer({
+      label: 'lazstream/pick-depth-staging',
+      size: 4,
+      usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+    })
+    this.pickIdStaging = this.device.createBuffer({
+      label: 'lazstream/pick-id-staging',
+      size: 4,
+      usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+    })
+
     // --- Bind group layouts -----------------------------------------------
     this.clearBindLayout = this.device.createBindGroupLayout({
       label: 'lazstream/clear-bgl',
       entries: [
-        { binding: 0, visibility: GPUShaderStage.COMPUTE,
-          buffer: { type: 'storage' } },
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }, // pick buffer
       ],
     })
 
@@ -267,6 +305,7 @@ export class WebGPURenderer {
         { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
         { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
         { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+        { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }, // pick buffer
       ],
     })
 
@@ -330,6 +369,9 @@ export class WebGPURenderer {
       }
     })
     this.resizeObserver.observe(ctx.canvas)
+
+    // --- Picking click listener -------------------------------------------
+    ctx.canvas.addEventListener('pointerdown', this.handleCanvasClick)
 
     // --- Start frame loop -------------------------------------------------
     this.writeViewportUniform()
@@ -555,6 +597,9 @@ export class WebGPURenderer {
       this.freeUniformSlotIdxs.push(MAX_SLOTS - 1 - i)
     }
 
+    // Pick reverse-lookup map → empty (mirrors chunkToUniformIdx)
+    this.uniformIdxToChunkIndex.clear()
+
     // Scene origin → 0; next loadSeedPoints() sets it from new seed bbox
     this.sceneCenter.x = 0
     this.sceneCenter.y = 0
@@ -658,6 +703,149 @@ export class WebGPURenderer {
   }
 
   /**
+   * Enable or disable the pick-ID G-buffer (T2).
+   *
+   * When enabled, each frame the pick buffer is allocated at full viewport size
+   * (~33 MB at 4K) and cleared to sentinel alongside the depth buffer.
+   * The depth shader writes an encoded (uniformIdx | pointIndex) ID per pixel
+   * in the atomicMin win-branch. Canvas clicks trigger a depth + ID readback,
+   * and `onPointPicked` fires with the decoded world position and chunk identity.
+   *
+   * When disabled (default), the pick buffer is a 4-byte stub — the shader still
+   * writes to binding 6 but all writes are silently dropped as OOB by WebGPU.
+   * T1 (world position from depth) is always available on click regardless of
+   * this flag; only T2 (identity) requires it.
+   */
+  setPickingEnabled(enabled: boolean): void {
+    if (this.pickEnabled === enabled) return
+    this.pickEnabled = enabled
+    this.pickBuffer.destroy()
+    const { w, h } = this.viewportPixels
+    const size = enabled ? Math.max(PICK_STUB_SIZE, w * h * 4) : PICK_STUB_SIZE
+    this.pickBuffer = this.device.createBuffer({
+      label: 'lazstream/pick',
+      size,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+    })
+    this.rebuildBindGroups()
+    this.needsRender = true
+  }
+
+  /**
+   * Canvas pointerdown → async depth (T1) + optional pick-ID (T2) readback.
+   *
+   * Debounced: concurrent clicks are silently ignored while a pick is in flight.
+   * Snapshots `viewProjInverse` at copy time so the async `mapAsync` resolution
+   * uses the matrix that generated the rendered depth values.
+   *
+   * Depth NDC assumption: the shader clips ndc.z to [0,1] and stores it via
+   * bitcast<u32>. Three.js PerspectiveCamera uses OpenGL-style projection
+   * (clip-space z in [-1,1]), so we remap: ndcZ = storedDepth * 2 - 1.
+   */
+  private handleCanvasClick = async (e: PointerEvent): Promise<void> => {
+    if (this.pickInFlight || this.disposed || !this.onPointPicked) return
+    this.pickInFlight = true
+
+    let depthMapped = false
+    let idMapped    = false
+
+    try {
+      const rect = this.ctx.canvas.getBoundingClientRect()
+      console.debug('[picking] pointerdown', { clientX: e.clientX, clientY: e.clientY, rect })
+      const dpr  = Math.min(window.devicePixelRatio || 1, MAX_DPR)
+      const cssX = e.clientX - rect.left
+      const cssY = e.clientY - rect.top
+      const px   = Math.floor(cssX * dpr)
+      const py   = Math.floor(cssY * dpr)
+      const { w, h } = this.viewportPixels
+      if (px < 0 || px >= w || py < 0 || py >= h) {
+        this.onPointPicked(null)
+        return
+      }
+
+      // Snapshot view-projection inverse at submit time (async-staleness fix).
+      // viewProj is refreshed each frame in writeCameraUniform().
+      this.pickViewProjInverse.copy(this.viewProj).invert()
+      const snapCX = this.sceneCenter.x
+      const snapCY = this.sceneCenter.y
+      const snapCZ = this.sceneCenter.z
+      const snapW  = w
+      const snapH  = h
+
+      const pixelIdx = py * w + px
+      const enc = this.device.createCommandEncoder({ label: 'pick' })
+      enc.copyBufferToBuffer(this.depthBuffer, pixelIdx * 4, this.pickDepthStaging, 0, 4)
+      if (this.pickEnabled) {
+        enc.copyBufferToBuffer(this.pickBuffer, pixelIdx * 4, this.pickIdStaging, 0, 4)
+      }
+      this.device.queue.submit([enc.finish()])
+
+      const mapPromises: Promise<void>[] = [
+        this.pickDepthStaging.mapAsync(GPUMapMode.READ),
+      ]
+      if (this.pickEnabled) {
+        mapPromises.push(this.pickIdStaging.mapAsync(GPUMapMode.READ))
+      }
+      await Promise.all(mapPromises)
+      if (this.disposed) return   // renderer torn down while awaiting
+      depthMapped = true
+      if (this.pickEnabled) idMapped = true
+
+      const depthU32 = new Uint32Array(this.pickDepthStaging.getMappedRange())[0]!
+      console.debug('[picking] depthU32=0x' + depthU32.toString(16).padStart(8, '0'),
+        depthU32 === 0xFFFFFFFF ? '(miss — background)' : '(hit)')
+      if (depthU32 === 0xFFFFFFFF) {
+        this.onPointPicked(null)
+        return
+      }
+
+      // Bit-cast u32 back to the float that the shader stored (ndc.z ∈ [0,1]).
+      const depthF = new Float32Array(new Uint32Array([depthU32]).buffer)[0]!
+
+      // NDC from pixel coordinates
+      const ndcX =  (px / snapW) * 2 - 1
+      const ndcY = -(py / snapH) * 2 + 1
+      // Remap [0,1] depth to OpenGL NDC [-1,1] for Three.js projectionMatrix inverse.
+      const ndcZ = depthF * 2 - 1
+
+      const clip = new THREE.Vector4(ndcX, ndcY, ndcZ, 1)
+        .applyMatrix4(this.pickViewProjInverse)
+      clip.divideScalar(clip.w)
+
+      const worldPos = {
+        x: clip.x + snapCX,
+        y: clip.y + snapCY,
+        z: clip.z + snapCZ,
+      }
+
+      let chunkIndex      = -1
+      let localPointIndex = -1
+
+      if (this.pickEnabled && idMapped) {
+        const pickId = new Uint32Array(this.pickIdStaging.getMappedRange())[0]!
+        if (pickId !== 0xFFFFFFFF) {
+          const uniformIdx = pickId >>> 19
+          localPointIndex  = pickId & 0x7FFFF
+          chunkIndex       = this.uniformIdxToChunkIndex.get(uniformIdx) ?? -1
+        }
+      }
+
+      this.onPointPicked({
+        worldPos,
+        screenPos: { x: cssX, y: cssY },
+        chunkIndex,
+        localPointIndex,
+      })
+    } catch (err) {
+      console.error('[picking] error during pick readback:', err)
+    } finally {
+      try { if (depthMapped) this.pickDepthStaging.unmap() } catch { /* disposed */ }
+      try { if (idMapped)    this.pickIdStaging.unmap()    } catch { /* disposed */ }
+      this.pickInFlight = false
+    }
+  }
+
+  /**
    * World-space 3D AABB of the camera's view frustum. Used by
    * SpatialIndex.queryFrustum() to gate chunk decode requests.
    *
@@ -748,12 +936,16 @@ export class WebGPURenderer {
     this.disposed = true
     if (this.rafHandle !== null) cancelAnimationFrame(this.rafHandle)
     this.resizeObserver?.disconnect()
+    this.ctx.canvas.removeEventListener('pointerdown', this.handleCanvasClick)
     this.controls.dispose()
     // GPU resources are released when the device is GC'd. We explicitly
     // destroy() the larger buffers to release device memory eagerly.
     this.ringBuffer.destroy()
     this.depthBuffer.destroy()
     this.colorBuffer.destroy()
+    this.pickBuffer.destroy()
+    this.pickDepthStaging.destroy()
+    this.pickIdStaging.destroy()
     this.cameraUniform.destroy()
     this.chunkUniform.destroy()
     this.viewportUniform.destroy()
@@ -813,6 +1005,7 @@ export class WebGPURenderer {
     // Assign a fresh uniform slot.
     const uniformIdx = this.freeUniformSlotIdxs.pop()!
     this.chunkToUniformIdx.set(chunkIndex, uniformIdx)
+    this.uniformIdxToChunkIndex.set(uniformIdx, chunkIndex)
 
     // Upload point data into the ring buffer at the allocated byte offset.
     this.device.queue.writeBuffer(
@@ -852,6 +1045,7 @@ export class WebGPURenderer {
     if (uniformIdx !== undefined) {
       this.freeUniformSlotIdxs.push(uniformIdx)
       this.chunkToUniformIdx.delete(chunkIndex)
+      this.uniformIdxToChunkIndex.delete(uniformIdx)
     }
     this.slots.remove(chunkIndex)
   }
@@ -914,13 +1108,22 @@ private evictInvisibleSlots(): void {
 
     this.depthBuffer = this.device.createBuffer({
       label: 'lazstream/depth',
+      // COPY_SRC added for T1 picking (copyBufferToBuffer to staging buffer)
       size: sizeBytes,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
     })
     this.colorBuffer = this.device.createBuffer({
       label: 'lazstream/color',
       size: sizeBytes,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    })
+
+    // Recreate pick buffer at new viewport size (or keep stub if picking inactive)
+    if (this.pickBuffer) this.pickBuffer.destroy()
+    this.pickBuffer = this.device.createBuffer({
+      label: 'lazstream/pick',
+      size: this.pickEnabled ? sizeBytes : PICK_STUB_SIZE,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
     })
 
     this.rebuildBindGroups()
@@ -932,7 +1135,10 @@ private evictInvisibleSlots(): void {
     this.clearBindGroup = this.device.createBindGroup({
       label: 'lazstream/clear-bg',
       layout: this.clearBindLayout,
-      entries: [{ binding: 0, resource: { buffer: this.depthBuffer } }],
+      entries: [
+        { binding: 0, resource: { buffer: this.depthBuffer } },
+        { binding: 1, resource: { buffer: this.pickBuffer } },
+      ],
     })
 
     this.depthBindGroup = this.device.createBindGroup({
@@ -945,6 +1151,7 @@ private evictInvisibleSlots(): void {
         { binding: 3, resource: { buffer: this.depthBuffer } },
         { binding: 4, resource: { buffer: this.colorBuffer } },
         { binding: 5, resource: { buffer: this.visibleSlotListBuf } },
+        { binding: 6, resource: { buffer: this.pickBuffer } },
       ],
     })
 
