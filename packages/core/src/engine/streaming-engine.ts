@@ -13,7 +13,7 @@
  * the per-tile worker inside it.
  */
 
-import type { LasHeader, ChunkTableEntry, SeedPoint } from '../types/las.js'
+import type { LasHeader, ChunkTableEntry, SeedPoint, PointAttributes } from '../types/las.js'
 import type { BBox3D } from '../types/spatial.js'
 import { classifyLazVersion, getLazVersionWarning } from '../types/las.js'
 import { validateSourceUrl } from '../network/url-validator.js'
@@ -346,6 +346,52 @@ export class StreamingEngine {
 
   /** Number of chunks in this file's chunk table. Available after load() passes the chunk-table stage. */
   get chunkCount(): number { return this.chunks.length }
+
+  /**
+   * T3 picking: resolve full attributes for a single point.
+   *
+   * Fetches compressed bytes for the chunk (IDB cache → network fallback),
+   * then dispatches a decode-attrs request to an idle worker which decodes
+   * up to pointIndex and extracts all raw LAS attribute fields.
+   */
+  async resolvePointAttributes(localChunkIndex: number, pointIndex: number): Promise<PointAttributes | null> {
+    const chunk = this.chunks[localChunkIndex]
+    if (!chunk || !this.workerPool || !this.header) return null
+
+    let compressedBytes: ArrayBuffer | null = null
+    let cacheHit = false
+
+    if (this.cache) {
+      compressedBytes = await this.cache.get(makeCacheKey(this.url, localChunkIndex, chunk.offset))
+      cacheHit = compressedBytes !== null
+    }
+
+    if (!compressedBytes) {
+      try {
+        compressedBytes = await fetchRange(
+          this.url,
+          chunk.offset,
+          chunk.offset + chunk.compressedSize - 1,
+          this.abortController?.signal,
+        )
+      } catch (err) {
+        if (!isAbortError(err)) console.warn('[lazstream] T3 fetch failed:', err)
+        return null
+      }
+    }
+
+    // Write to cache before transferring (buffer is detached after postMessage)
+    if (!cacheHit && this.cache) {
+      void this.cache.set(makeCacheKey(this.url, localChunkIndex, chunk.offset), compressedBytes.slice(0))
+    }
+
+    try {
+      return await this.workerPool.requestPointAttributes(compressedBytes, pointIndex)
+    } catch (err) {
+      console.warn('[lazstream] T3 decode failed:', err)
+      return null
+    }
+  }
 
   dispose(): void {
     this.abortController?.abort()

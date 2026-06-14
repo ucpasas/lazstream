@@ -26,7 +26,7 @@ export type { CameraInfo } from './decode/chunk-priority.js'
 export type { LazstreamAssetUrls } from './decode/worker-pool.js'
 
 // ── Data types — what flows out of the engine ────────────────────────────────
-export type { LasHeader, LazVlr, SeedPoint, ChunkTableEntry, PointDataRecordFormat, LazVersion } from './types/las.js'
+export type { LasHeader, LazVlr, SeedPoint, ChunkTableEntry, PointDataRecordFormat, LazVersion, PointAttributes } from './types/las.js'
 export type { BBox3D } from './types/spatial.js'
 export type { DecodedChunk } from './decode/worker-pool.js'
 

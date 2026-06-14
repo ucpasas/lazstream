@@ -24,7 +24,7 @@
 import { StreamingEngine } from './streaming-engine.js'
 import type { EngineEvents, RingBufferProvider, StreamingEngineOptions } from './streaming-engine.js'
 import type { Manifest } from './manifest-types.js'
-import type { LasHeader, SeedPoint } from '../types/las.js'
+import type { LasHeader, SeedPoint, PointAttributes } from '../types/las.js'
 import type { BBox3D } from '../types/spatial.js'
 import type { CameraInfo } from '../decode/chunk-priority.js'
 import type { DecodedChunk } from '../decode/worker-pool.js'
@@ -81,6 +81,19 @@ export class ManifestSession {
   /** Tick all active tile engines — call every frame from the render loop. */
   updateCamera(): void {
     for (const e of this.engines) e.updateCamera()
+  }
+
+  /**
+   * T3 picking: resolve full attributes for a single point identified by global chunk index.
+   *
+   * Routes to the correct tile engine (strips the tile offset) then delegates to
+   * StreamingEngine.resolvePointAttributes. Returns null if the chunk index is
+   * unknown or the decode path is not yet implemented.
+   */
+  async resolvePointAttributes(chunkIndex: number, pointIndex: number): Promise<PointAttributes | null> {
+    const { engine, localIndex } = this.resolveGlobalIndex(chunkIndex)
+    if (!engine) return null
+    return engine.resolvePointAttributes(localIndex, pointIndex)
   }
 
   /** Stop all engines and release all resources. */

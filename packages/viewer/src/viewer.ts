@@ -17,10 +17,27 @@ import type {
   ManifestSessionOptions,
   EngineEvents,
   LazstreamAssetUrls,
+  PointAttributes,
 } from '@lazstream/core'
 import { WebGPURenderer, WebGPUUnsupportedError } from './render/webgpu-renderer.js'
+import type { RawPick } from './render/picking.js'
 
 export { WebGPUUnsupportedError }
+export type { PointAttributes }
+
+/**
+ * Resolved pick result exposed to application code.
+ * T1 (worldPos) is always present on a hit. T2 fields are present only when
+ * picking is enabled via setPickingEnabled(true). T3 (attributes) is present
+ * only when resolveAttributes: true in ViewerOptions and T3 resolves non-null.
+ */
+export interface PickResult {
+  worldPos:   { x: number; y: number; z: number }
+  screenPos:  { x: number; y: number }
+  chunkIndex?: number
+  pointIndex?: number
+  attributes?: PointAttributes
+}
 
 export interface ViewerOptions {
   /** GPU ring buffer capacity in bytes. Default: adapter-negotiated (~2 GB). */
@@ -39,6 +56,12 @@ export interface ViewerOptions {
    * In dev mode the viewer automatically points to /lib/ so this is rarely needed.
    */
   assetUrls?: LazstreamAssetUrls
+  /**
+   * When true and a pick resolves to a point identity (T2), automatically call
+   * resolvePointAttributes() and include the result in PickResult.attributes.
+   * Adds a few ms per click for the chunk re-decode. Default: false.
+   */
+  resolveAttributes?: boolean
   onStateChange?: EngineEvents['onStateChange']
   onProgress?: EngineEvents['onProgress']
   onWarning?: EngineEvents['onWarning']
@@ -50,6 +73,13 @@ export class LazstreamViewer {
   private renderer: WebGPURenderer
   private activeSession: ManifestSession | null = null
   private readonly options: ViewerOptions
+
+  /**
+   * Fires when the user clicks the canvas and a pick completes.
+   * Null = click hit no point (empty space).
+   * Set onPointPicked before calling setPickingEnabled(true).
+   */
+  onPointPicked: ((result: PickResult | null) => void) | null = null
 
   private constructor(renderer: WebGPURenderer, options: ViewerOptions) {
     this.renderer = renderer
@@ -148,6 +178,54 @@ export class LazstreamViewer {
     this.renderer.setChunkEvictedCallback(idx => session.onChunkEvictedFromGPU(idx))
 
     await session.load()
+  }
+
+  /**
+   * Activate or deactivate the pick-ID G-buffer (T2).
+   *
+   * When enabled, every canvas click triggers a depth + ID readback and fires
+   * `onPointPicked`. The GPU pick buffer (~33 MB at 4K) is allocated only while
+   * active. T1 (world position) fires regardless; T2 (chunkIndex/pointIndex)
+   * requires this to be true.
+   *
+   * Call this after setting `onPointPicked` so the first click is handled.
+   */
+  setPickingEnabled(enabled: boolean): void {
+    this.renderer.setPickingEnabled(enabled)
+
+    if (enabled) {
+      this.renderer.onPointPicked = async (raw: RawPick | null) => {
+        if (!this.onPointPicked) return
+
+        if (!raw) {
+          this.onPointPicked(null)
+          return
+        }
+
+        const result: PickResult = {
+          worldPos:  raw.worldPos,
+          screenPos: raw.screenPos,
+          chunkIndex:  raw.chunkIndex  >= 0 ? raw.chunkIndex  : undefined,
+          pointIndex:  raw.localPointIndex >= 0 ? raw.localPointIndex : undefined,
+        }
+
+        if (
+          this.options.resolveAttributes &&
+          raw.chunkIndex >= 0 &&
+          raw.localPointIndex >= 0 &&
+          this.activeSession
+        ) {
+          const attrs = await this.activeSession.resolvePointAttributes(
+            raw.chunkIndex, raw.localPointIndex,
+          )
+          if (attrs) result.attributes = attrs
+        }
+
+        this.onPointPicked(result)
+      }
+    } else {
+      this.renderer.onPointPicked = null
+    }
   }
 
   /** Stop all streaming and release all GPU + worker resources. */
