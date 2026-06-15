@@ -1,2 +1,3 @@
 export { LazstreamViewer, WebGPUUnsupportedError } from './viewer.js'
-export type { ViewerOptions } from './viewer.js'
+export type { ViewerOptions, PickResult, PointAttributes } from './viewer.js'
+export type { RawPick } from './render/webgpu-renderer.js'

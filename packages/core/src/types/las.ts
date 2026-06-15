@@ -79,6 +79,26 @@ export interface ChunkTableEntry {
   pointCount: number
 }
 
+/**
+ * Full attribute record for a single LAZ point, resolved on demand via T3 picking.
+ * Fields present depend on the PDRF of the file.
+ */
+export interface PointAttributes {
+  x: number
+  y: number
+  z: number
+  intensity: number
+  classification: number
+  returnNumber: number
+  numberOfReturns: number
+  /** GPS time (seconds of GPS week). Present in PDRFs 1, 3, 5, 6–10. */
+  gpsTime?: number
+  /** Red channel 0–255. Present in PDRFs 2, 3, 5, 7, 8, 10. */
+  r?: number
+  g?: number
+  b?: number
+}
+
 export interface SeedPoint {
   // World coordinates (after applying scale + offset from LAS header)
   x: number

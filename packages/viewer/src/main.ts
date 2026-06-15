@@ -154,6 +154,15 @@ async function main(): Promise<void> {
 
   if (splatRadius !== undefined) renderer.setSplatRadius(splatRadius)
 
+  renderer.onPointPicked = async (pick) => {
+    console.log('[pick]', pick)
+    if (pick && pick.chunkIndex >= 0 && pick.localPointIndex >= 0 && activeSession) {
+      const attrs = await activeSession.resolvePointAttributes(pick.chunkIndex, pick.localPointIndex)
+      console.log('[pick:attrs]', attrs)
+    }
+  }
+  renderer.setPickingEnabled(true)
+
   // ─── Share button ─────────────────────────────────────────────────────────
 
   shareBtn.addEventListener('click', () => {
