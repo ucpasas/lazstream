@@ -24,7 +24,7 @@ export default defineConfig(({ mode }) => {
         formats: ['es'],
         fileName: 'index',
       } : undefined,
-      rollupOptions: isLib ? {
+      rolldownOptions: isLib ? {
         external: ['three', /^three\//, '@lazstream/core'],
       } : undefined,
     },
