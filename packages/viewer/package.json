@@ -40,8 +40,9 @@
     "@types/three": "^0.168.0",
     "@webgpu/types": "^0.1.69",
     "three": "^0.168.0",
+    "rollup": "^4.0.0",
     "typescript": "^5.5.0",
-    "vite": "^6.0.0",
-    "vite-plugin-dts": "^4.0.0"
+    "vite": "^8.0.0",
+    "vite-plugin-dts": "^5.0.0"
   }
 }
