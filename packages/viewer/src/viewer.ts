@@ -20,10 +20,11 @@ import type {
   PointAttributes,
 } from '@lazstream/core'
 import { WebGPURenderer, WebGPUUnsupportedError } from './render/webgpu-renderer.js'
+import type { ColorMode } from './render/webgpu-renderer.js'
 import type { RawPick } from './render/picking.js'
 
 export { WebGPUUnsupportedError }
-export type { PointAttributes }
+export type { PointAttributes, ColorMode }
 
 /**
  * Resolved pick result exposed to application code.
@@ -62,6 +63,8 @@ export interface ViewerOptions {
    * Adds a few ms per click for the chunk re-decode. Default: false.
    */
   resolveAttributes?: boolean
+  /** Initial colour mode. Default: 'rgb' if the file has native colour, else 'height'. */
+  colorMode?: ColorMode
   onStateChange?: EngineEvents['onStateChange']
   onProgress?: EngineEvents['onProgress']
   onWarning?: EngineEvents['onWarning']
@@ -80,6 +83,14 @@ export class LazstreamViewer {
    * Set onPointPicked before calling setPickingEnabled(true).
    */
   onPointPicked: ((result: PickResult | null) => void) | null = null
+
+  /**
+   * Fires after every setColorMode() call with the RESOLVED mode.
+   * The resolved mode may differ from the requested mode (e.g. 'rgb' resolves
+   * to 'height' when the file has no native colour). Always reflects the mode
+   * that is actually active on the GPU.
+   */
+  onColorModeChanged: ((resolved: ColorMode) => void) | null = null
 
   private constructor(renderer: WebGPURenderer, options: ViewerOptions) {
     this.renderer = renderer
@@ -148,6 +159,11 @@ export class LazstreamViewer {
         onError:       this.options.onError,
         onSeedsReady: (seeds, header) => {
           this.renderer.loadSeedPoints(seeds, header)
+          // Apply initial colour mode from ViewerOptions if provided (consumer owns URL sync).
+          if (this.options.colorMode) {
+            const resolved = this.renderer.setColorMode(this.options.colorMode)
+            this.onColorModeChanged?.(resolved)
+          }
           this.startDecodeLoop(session)
         },
         onChunkDecoded: (chunk) => {
@@ -226,6 +242,31 @@ export class LazstreamViewer {
     } else {
       this.renderer.onPointPicked = null
     }
+  }
+
+  /**
+   * Switch the colour mode. No re-decode — just a uniform flip, takes effect next frame.
+   * Modes: 'rgb' (native), 'height' (elevation ramp), 'intensity' (grayscale),
+   * 'classification' (ASPRS palette).
+   *
+   * Returns the RESOLVED mode. If 'rgb' is requested on a file without native colour,
+   * it silently resolves to 'height'. The onColorModeChanged callback always fires with
+   * the resolved mode.
+   */
+  setColorMode(mode: ColorMode): ColorMode {
+    const resolved = this.renderer.setColorMode(mode)
+    this.onColorModeChanged?.(resolved)
+    return resolved
+  }
+
+  /** Returns which colour modes are available for the loaded file. 'rgb' is absent for PDRFs without colour. */
+  getAvailableColorModes(): ColorMode[] {
+    return this.renderer.getAvailableColorModes()
+  }
+
+  /** Current colour mode. */
+  get colorMode(): ColorMode {
+    return this.renderer.currentColorMode
   }
 
   /** Stop all streaming and release all GPU + worker resources. */

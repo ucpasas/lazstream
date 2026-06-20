@@ -2,12 +2,14 @@
  * Pack source point data into the GPU storage layout.
  *
  * Source format (from Track A decoder workers — see [[Decoder Workers]] wiki):
- *   positions: Int16Array, length = pointCount * 3   (x, y, z per-chunk quantized)
- *   colors:    Uint8Array, length = pointCount * 4   (RGBA, A typically unused)
+ *   positions:      Int16Array, length = pointCount * 3   (x, y, z per-chunk quantized)
+ *   colors:         Uint8Array, length = pointCount * 4   (RGBA, A typically unused)
+ *   classification: Uint8Array, length = pointCount       (ASPRS class byte)
+ *   intensity8:     Uint8Array, length = pointCount       (seed-range-stretched intensity)
  *
  * GPU layout (12 bytes per point, 3 × u32):
  *   word 0:  x in low 16 bits | y in high 16 bits
- *   word 1:  z in low 16 bits | reserved/flags in high 16 bits (zero for now)
+ *   word 1:  z in low 16 bits | intensity8 in bits 16–23 | classification in bits 24–31
  *   word 2:  RGBA8 little-endian: R | (G<<8) | (B<<16) | (A<<24)
  *
  * The compute shader reinterprets the int16 halves to signed via bit-twiddling
@@ -34,16 +36,18 @@ export interface SeedPoint {
  * The returned buffer is ready to upload via queue.writeBuffer().
  */
 export function packChunk(chunk: DecodedChunk): Uint32Array {
-  const { positions, colors, pointCount } = chunk
+  const { positions, colors, classification, intensity8, pointCount } = chunk
   const packed = new Uint32Array(pointCount * 3)
 
   for (let i = 0; i < pointCount; i++) {
     // `& 0xFFFF` masks the int16 bit pattern into the low 16 bits of a u32.
     // Negative ints (e.g. -1) become 0xFFFF, which is what the shader expects
     // to sign-extend back to -1.
-    const xi = positions[i * 3 + 0] & 0xFFFF
-    const yi = positions[i * 3 + 1] & 0xFFFF
-    const zi = positions[i * 3 + 2] & 0xFFFF
+    const xi  = positions[i * 3 + 0] & 0xFFFF
+    const yi  = positions[i * 3 + 1] & 0xFFFF
+    const zi  = positions[i * 3 + 2] & 0xFFFF
+    const cls = classification ? classification[i] : 0
+    const i8  = intensity8    ? intensity8[i]     : 0
 
     const r = colors[i * 4 + 0]
     const g = colors[i * 4 + 1]
@@ -51,7 +55,8 @@ export function packChunk(chunk: DecodedChunk): Uint32Array {
     const a = colors[i * 4 + 3]
 
     packed[i * 3 + 0] = (yi << 16) | xi
-    packed[i * 3 + 1] = zi
+    // word 1: z in low 16 bits, intensity8 in bits 16–23, classification in bits 24–31
+    packed[i * 3 + 1] = ((cls << 24) | (i8 << 16) | zi) >>> 0
     packed[i * 3 + 2] = ((a << 24) | (b << 16) | (g << 8) | r) >>> 0
   }
 
