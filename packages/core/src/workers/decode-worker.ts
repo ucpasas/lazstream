@@ -224,6 +224,8 @@ function decodeChunk(req: {
   offsetX: number; offsetY: number; offsetZ: number
   globalMinZ: number
   globalMaxZ: number
+  seedLo: number  // uint16 p1 of seed intensities (0 if no seed range)
+  seedHi: number  // uint16 p99 of seed intensities (65535 if no seed range)
 }): void {
   try {
     if (!Module || !decoder) {
@@ -263,6 +265,8 @@ function decodeChunk(req: {
     const rawR = hasRgb ? new Uint8Array(req.pointCount) : null
     const rawG = hasRgb ? new Uint8Array(req.pointCount) : null
     const rawB = hasRgb ? new Uint8Array(req.pointCount) : null
+    const rawIntensity   = new Uint16Array(req.pointCount)
+    const rawClassify    = new Uint8Array(req.pointCount)
 
     let minX = Infinity,  minY = Infinity,  minZ = Infinity
     let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity
@@ -287,6 +291,14 @@ function decodeChunk(req: {
       if (wy < minY) minY = wy; if (wy > maxY) maxY = wy
       if (wz < minZ) minZ = wz; if (wz > maxZ) maxZ = wz
 
+      // Intensity — uint16 at bytes 12–13, all PDRFs
+      rawIntensity[i] = Module.HEAPU16[(pointPtr + 12) >> 1]
+
+      // Classification: 5-bit field in byte 15 for PDRF 0–5; full byte 16 for PDRF 6–10
+      rawClassify[i] = pdrf <= 5
+        ? (Module.HEAPU8[pointPtr + 15] & 0x1F)
+        : Module.HEAPU8[pointPtr + 16]
+
       if (hasRgb) {
         // HEAPU16 reads uint16 (2 bytes); >> 1 converts byte offset to uint16 index.
         // LAS RGB is uint16 full-scale; >> 8 converts to uint8.
@@ -301,14 +313,20 @@ function decodeChunk(req: {
     const rangeY = maxY - minY || 1
     const rangeZ = maxZ - minZ || 1
 
-    const positions = new Int16Array(req.pointCount * 3)
-    const colors    = new Uint8Array(req.pointCount * 4)
-    const globalRangeZ = req.globalMaxZ - req.globalMinZ || 1
+    const positions      = new Int16Array(req.pointCount * 3)
+    const colors         = new Uint8Array(req.pointCount * 4)
+    const classification = new Uint8Array(req.pointCount)
+    const intensity8     = new Uint8Array(req.pointCount)
+    const globalRangeZ   = req.globalMaxZ - req.globalMinZ || 1
+    const seedRange      = Math.max(req.seedHi - req.seedLo, 1)
 
     for (let i = 0; i < req.pointCount; i++) {
       positions[i * 3]     = Math.round(((rawX[i] - minX) / rangeX) * 65535 - 32768)
       positions[i * 3 + 1] = Math.round(((rawY[i] - minY) / rangeY) * 65535 - 32768)
       positions[i * 3 + 2] = Math.round(((rawZ[i] - minZ) / rangeZ) * 65535 - 32768)
+
+      classification[i] = rawClassify[i]
+      intensity8[i] = Math.min(255, Math.max(0, Math.round((rawIntensity[i] - req.seedLo) / seedRange * 255)))
 
       if (hasRgb) {
         colors[i * 4]     = rawR![i]
@@ -332,13 +350,13 @@ function decodeChunk(req: {
       {
         type: 'decoded',
         chunkIndex: req.chunkIndex,
-        positions, colors,
+        positions, colors, classification, intensity8,
         pointCount: req.pointCount,
         minX, minY, minZ,
         maxX, maxY, maxZ,
         decodeMs,
       },
-      [positions.buffer, colors.buffer]
+      [positions.buffer, colors.buffer, classification.buffer, intensity8.buffer]
     )
 
   } catch (err) {

@@ -47,6 +47,10 @@ export interface DecodedChunk {
   chunkIndex: number
   positions: Int16Array
   colors: Uint8Array
+  /** Per-point classification byte. Present for all PDRFs. */
+  classification?: Uint8Array
+  /** Per-point intensity, seed-range-stretched to [0,255]. Present for all PDRFs. */
+  intensity8?: Uint8Array
   pointCount: number
   minX: number; minY: number; minZ: number
   maxX: number; maxY: number; maxZ: number
@@ -88,6 +92,7 @@ export class WorkerPool {
   private events: WorkerPoolEvents
   private header: LasHeader | null = null
   private lazVlr: LazVlr | null = null
+  private intensitySeedRange: { lo: number; hi: number } | null = null
   private readyCount = 0
   private targetCount: number
   private disposed = false
@@ -226,12 +231,16 @@ export class WorkerPool {
    * Track A Step 3: URL no longer required — the pool doesn't fetch.
    * Header gives PDRF, scale, offset, global Z range. LAZ VLR is held
    * for parity with future selective-decode paths (PDRF 6+ layered).
+   * intensitySeedRange is the p1/p99 uint16 range from seed-point intensities,
+   * used to stretch decoded intensity values into [0,255] before packing.
    */
-  configure(header: LasHeader, lazVlr: LazVlr): void {
+  configure(header: LasHeader, lazVlr: LazVlr, intensitySeedRange?: { lo: number; hi: number }): void {
     this.header = header
     this.lazVlr = lazVlr
+    this.intensitySeedRange = intensitySeedRange ?? null
     console.debug('[lazstream] WorkerPool configured:', {
       pdrf: header.pointDataRecordFormat,
+      intensitySeedRange: intensitySeedRange ?? '(none)',
     })
   }
 
@@ -352,6 +361,8 @@ export class WorkerPool {
       offsetZ: this.header.offsetZ,
       globalMinZ: this.header.minZ,
       globalMaxZ: this.header.maxZ,
+      seedLo: this.intensitySeedRange?.lo ?? 0,
+      seedHi: this.intensitySeedRange?.hi ?? 65535,
     }, [compressedBytes])
   }
 
@@ -366,6 +377,8 @@ export class WorkerPool {
       chunkIndex,
       positions: msg.positions,
       colors: msg.colors,
+      classification: msg.classification,
+      intensity8: msg.intensity8,
       pointCount: msg.pointCount,
       minX: msg.minX, minY: msg.minY, minZ: msg.minZ,
       maxX: msg.maxX, maxY: msg.maxY, maxZ: msg.maxZ,

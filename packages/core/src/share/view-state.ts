@@ -19,6 +19,8 @@ export interface ViewState {
   /** Bare .laz URL or .lazm.json manifest URL. */
   source: string
   cam: CameraState
+  /** Active colour mode. Optional — old tokens without this field default to the file-derived mode. */
+  colorMode?: string
 }
 
 export class ViewStateDecodeError extends Error {

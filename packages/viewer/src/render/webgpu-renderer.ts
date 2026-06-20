@@ -45,7 +45,17 @@ import {
 } from './point-packing'
 import type { RawPick } from './picking'
 export type { RawPick } from './picking'
+import { CLASS_LUT } from './colormaps'
 import type { DecodedChunk, BBox3D, LasHeader, CameraState } from '@lazstream/core'
+
+export type ColorMode = 'rgb' | 'height' | 'intensity' | 'classification'
+const COLOR_MODE_VALUE: Record<ColorMode, number> = {
+  rgb:            0,
+  height:         1,
+  intensity:      2,
+  classification: 3,
+}
+const COLOR_PARAMS_BYTES = 32   // struct ColorParams: 8 × f32/u32
 
 // --- Constants ---------------------------------------------------------------
 
@@ -207,6 +217,14 @@ export class WebGPURenderer {
   private readonly cullFrustum = new THREE.Frustum()
   private readonly cullSlotBox = new THREE.Box3()
 
+  // Color mode
+  private colorMode: ColorMode = 'height'
+  private hasRGB = false
+  private globalMinZ = 0
+  private globalMaxZ = 1
+  private readonly colorParamsBuffer: GPUBuffer  // ColorParams uniform, 32 bytes
+  private readonly classLutBuffer: GPUBuffer     // classLUT storage, 256 * 4 bytes
+
   // Options
   private readonly edlStrength: number
   private readonly edlRadius: number
@@ -275,6 +293,19 @@ export class WebGPURenderer {
     this.chunkUniformScratch    = new Float32Array(CHUNK_UNIFORM_BYTES / 4)
     this.visibleSlotListScratch = new Uint32Array(MAX_SLOTS)
 
+    // Color-mode buffers
+    this.colorParamsBuffer = this.device.createBuffer({
+      label: 'lazstream/color-params',
+      size: COLOR_PARAMS_BYTES,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    })
+    this.classLutBuffer = this.device.createBuffer({
+      label: 'lazstream/class-lut',
+      size: CLASS_LUT.byteLength,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    })
+    this.device.queue.writeBuffer(this.classLutBuffer, 0, CLASS_LUT.buffer, CLASS_LUT.byteOffset, CLASS_LUT.byteLength)
+
     // Pick staging buffers (created once, 4 bytes each)
     this.pickDepthStaging = this.device.createBuffer({
       label: 'lazstream/pick-depth-staging',
@@ -305,7 +336,9 @@ export class WebGPURenderer {
         { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
         { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
         { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-        { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }, // pick buffer
+        { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },        // pick buffer
+        { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },        // colorParams
+        { binding: 8, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // classLUT
       ],
     })
 
@@ -375,6 +408,7 @@ export class WebGPURenderer {
 
     // --- Start frame loop -------------------------------------------------
     this.writeViewportUniform()
+    this.writeColorParams()
     this.rafHandle = requestAnimationFrame(this.renderFrame)
   }
 
@@ -400,6 +434,21 @@ export class WebGPURenderer {
 
     const packed = packSeedsAsChunk(seeds)
     if (packed.pointCount === 0) return
+
+    // Capture color-relevant header fields and write the initial ColorParams.
+    if (header) {
+      const pdrf = header.pointDataRecordFormat
+      this.hasRGB   = pdrf === 2 || pdrf === 3 || pdrf === 5 || pdrf === 7 || pdrf === 8 || pdrf === 10
+      this.globalMinZ = header.minZ
+      this.globalMaxZ = header.maxZ
+      // Default mode: rgb if the file has native colour, else height.
+      this.colorMode = this.hasRGB ? 'rgb' : 'height'
+      this.writeColorParams()
+      console.debug(
+        `[color] available modes: ${this.getAvailableColorModes().join(', ')}  ` +
+        `default=${this.colorMode}`
+      )
+    }
 
     // Camera framing: prefer the LAS header bbox (authoritative — covers
     // every point in the file, not just sampled seeds). Falls back to the
@@ -702,6 +751,42 @@ export class WebGPURenderer {
     this.splatRadius = Math.max(1, Math.round(n))
   }
 
+  setColorMode(mode: ColorMode): ColorMode {
+    const resolved: ColorMode = (mode === 'rgb' && !this.hasRGB) ? 'height' : mode
+    if (this.colorMode === resolved) return resolved
+    this.colorMode = resolved
+    this.writeColorParams()
+    this.needsRender = true
+    if (resolved !== mode) {
+      console.debug(`[color] mode=${resolved} (requested ${mode}→resolved)`)
+    } else {
+      console.debug(`[color] mode=${resolved}`)
+    }
+    return resolved
+  }
+
+  get currentColorMode(): ColorMode { return this.colorMode }
+
+  getAvailableColorModes(): ColorMode[] {
+    const modes: ColorMode[] = ['height', 'intensity', 'classification']
+    if (this.hasRGB) modes.unshift('rgb')
+    return modes
+  }
+
+  private writeColorParams(): void {
+    const buf = new ArrayBuffer(COLOR_PARAMS_BYTES)
+    const dv  = new DataView(buf)
+    dv.setUint32( 0, COLOR_MODE_VALUE[this.colorMode], true)
+    dv.setUint32( 4, 0, true)                                         // _pad0
+    dv.setFloat32(8,  this.globalMinZ, true)
+    dv.setFloat32(12, this.globalMaxZ, true)
+    dv.setFloat32(16, 0.0, true)                                       // intensityLo identity
+    dv.setFloat32(20, 1.0, true)                                       // intensityHi identity
+    dv.setFloat32(24, 0.0, true)                                       // _pad1.x
+    dv.setFloat32(28, 0.0, true)                                       // _pad1.y
+    this.device.queue.writeBuffer(this.colorParamsBuffer, 0, buf)
+  }
+
   /**
    * Enable or disable the pick-ID G-buffer (T2).
    *
@@ -949,6 +1034,8 @@ export class WebGPURenderer {
     this.cameraUniform.destroy()
     this.chunkUniform.destroy()
     this.viewportUniform.destroy()
+    this.colorParamsBuffer.destroy()
+    this.classLutBuffer.destroy()
     // Note: we don't `device.destroy()` because the canvas may outlive us
     // and another renderer instance might re-use the device.
   }
@@ -1152,6 +1239,8 @@ private evictInvisibleSlots(): void {
         { binding: 4, resource: { buffer: this.colorBuffer } },
         { binding: 5, resource: { buffer: this.visibleSlotListBuf } },
         { binding: 6, resource: { buffer: this.pickBuffer } },
+        { binding: 7, resource: { buffer: this.colorParamsBuffer } },
+        { binding: 8, resource: { buffer: this.classLutBuffer } },
       ],
     })
 

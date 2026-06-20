@@ -174,6 +174,41 @@ renderer.setPickingEnabled(true)
 
 ---
 
+## Colour modes
+
+lazstream renders point clouds in four colour modes. Switching is instant — no re-decode, no re-stream.
+
+| Mode | Key | Description |
+|------|-----|-------------|
+| `'rgb'` | `1` | Native colour from the LAZ file. Only available for colour-carrying PDRFs (2, 3, 5, 7, 8, 10). |
+| `'height'` | `2` | Elevation ramp (green → yellow → red). Always available. Default for non-colour files. |
+| `'intensity'` | `3` | Greyscale intensity, normalised to the p1–p99 range of the seed scan. Always available. |
+| `'classification'` | `4` | ASPRS classification palette (ground, vegetation, buildings, water, …). Always available. |
+
+```typescript
+import { LazstreamViewer } from '@lazstream/viewer'
+import type { ColorMode } from '@lazstream/viewer'
+
+const viewer = await LazstreamViewer.create(canvas)
+
+// React to mode changes — fires with the resolved mode
+// ('rgb' silently resolves to 'height' for non-colour files)
+viewer.onColorModeChanged = (resolved: ColorMode) => {
+  updateUI(resolved)
+}
+
+await viewer.load(url)
+
+// Switch at runtime — no reload, takes effect next frame
+viewer.setColorMode('intensity')   // returns the resolved ColorMode
+viewer.colorMode                   // 'intensity'
+viewer.getAvailableColorModes()    // ['height', 'intensity', 'classification'] for non-colour PDRF
+```
+
+In the built-in viewer app, keys `1`–`4` switch modes live and the `#v=` share link preserves the active mode.
+
+---
+
 ## Design
 
 ### No preprocessing required

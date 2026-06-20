@@ -392,8 +392,9 @@ encodeViewState(state: ViewState): string
 decodeViewState(token: string): ViewState   // throws ViewStateDecodeError on invalid input
 
 interface ViewState {
-  source: string     // .laz or .lazm.json URL
+  source: string       // .laz or .lazm.json URL
   cam: CameraState
+  colorMode?: string   // active colour mode — omitted in old tokens; consumers default to file-derived mode
 }
 
 interface CameraState {
