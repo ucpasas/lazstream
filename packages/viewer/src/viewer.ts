@@ -52,9 +52,13 @@ export interface ViewerOptions {
   /** Point splat radius in pixels. Default: 2 (3 × 3 px). */
   splatRadius?: number
   /**
-   * Asset URL overrides for non-standard hosting (CDN prefix, custom hashes).
-   * The viewer passes these through to ManifestSession → WorkerPool.
-   * In dev mode the viewer automatically points to /lib/ so this is rarely needed.
+   * Asset URL overrides for laz-perf worker assets.
+   * Passed through to ManifestSession → WorkerPool.
+   * Defaults: WorkerPool resolves assets relative to its own module via import.meta.url,
+   * which works correctly when @lazstream/core is installed from npm and not pre-bundled
+   * by Vite. Add `lazstreamVitePlugin()` to your vite.config.ts to ensure this.
+   * For non-Vite bundlers, pass explicit URLs pointing at the assets from
+   * node_modules/@lazstream/core/dist/.
    */
   assetUrls?: LazstreamAssetUrls
   /**
@@ -143,13 +147,6 @@ export class LazstreamViewer {
 
     const { workerCount, sseThreshold, maxFetches, assetUrls } = this.options
 
-    // In dev mode (Vite serves laz-perf from /lib/), default assetUrls to the
-    // public/lib/ paths so WorkerPool's import.meta.url fallback isn't used.
-    const resolvedAssetUrls: LazstreamAssetUrls = assetUrls ?? {
-      lazPerfJsUrl:   new URL('/lib/laz-perf-worker.js',   location.href).href,
-      lazPerfWasmUrl: new URL('/lib/laz-perf-worker.wasm', location.href).href,
-    }
-
     const sessionOptions: ManifestSessionOptions = {
       events: {
         onStateChange: this.options.onStateChange,
@@ -173,7 +170,7 @@ export class LazstreamViewer {
       workerCount,
       sseThreshold,
       maxFetches,
-      assetUrls: resolvedAssetUrls,
+      assetUrls,
     }
 
     const session = new ManifestSession(manifest, sessionOptions)
