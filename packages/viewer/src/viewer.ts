@@ -18,13 +18,14 @@ import type {
   EngineEvents,
   LazstreamAssetUrls,
   PointAttributes,
+  CameraState,
 } from '@lazstream/core'
 import { WebGPURenderer, WebGPUUnsupportedError } from './render/webgpu-renderer.js'
 import type { ColorMode } from './render/webgpu-renderer.js'
 import type { RawPick } from './render/picking.js'
 
 export { WebGPUUnsupportedError }
-export type { PointAttributes, ColorMode }
+export type { PointAttributes, ColorMode, CameraState }
 
 /**
  * Resolved pick result exposed to application code.
@@ -264,6 +265,35 @@ export class LazstreamViewer {
   /** Current colour mode. */
   get colorMode(): ColorMode {
     return this.renderer.currentColorMode
+  }
+
+  /**
+   * Return the current camera position and look-at target in world coordinates.
+   * Returns null if no point cloud is loaded (renderer has no sceneCenter yet).
+   *
+   * Use this to read the current view for external camera sync (e.g. driving a
+   * MapLibre map to match the point cloud camera).
+   */
+  getCameraState(): CameraState | null {
+    if (!this.renderer) return null
+    return this.renderer.getCameraState()
+  }
+
+  /**
+   * Restore the camera to a saved CameraState.
+   *
+   * TIMING CONSTRAINT: must be called after the first seed points have loaded
+   * (i.e. after `onProgress` fires with phase === 'seeds' or after `onStateChange`
+   * fires with state === 'streaming'). Calling before seeds are loaded means
+   * `sceneCenter` is still zero and the world→scene-local conversion will be wrong,
+   * placing the camera at an incorrect position.
+   *
+   * Use this to drive the point cloud camera from an external source (e.g. a
+   * MapLibre map move event converted to a CameraState).
+   */
+  applyCameraState(state: CameraState): void {
+    if (!this.renderer) return
+    this.renderer.applyCameraState(state)
   }
 
   /** Stop all streaming and release all GPU + worker resources. */

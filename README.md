@@ -209,6 +209,38 @@ In the built-in viewer app, keys `1`–`4` switch modes live and the `#v=` share
 
 ---
 
+## Camera control
+
+`LazstreamViewer` exposes two methods for reading and driving the camera — useful for map sync, saved viewpoints, animation, and tour playback.
+
+```typescript
+import { LazstreamViewer } from '@lazstream/viewer'
+import type { CameraState } from '@lazstream/viewer'
+
+const viewer = await LazstreamViewer.create(canvas, {
+  onStateChange(state) {
+    if (state === 'streaming') {
+      // Seeds are loaded — sceneCenter is set. Safe to restore a saved position.
+      viewer.applyCameraState(savedState)
+    }
+  },
+})
+await viewer.load(url)
+
+// Read the current camera position and look-at target (world coordinates)
+const state: CameraState | null = viewer.getCameraState()
+// { x, y, z, tx, ty, tz, fovY }
+```
+
+| Method | Returns | When to call |
+|--------|---------|--------------|
+| `getCameraState()` | `CameraState \| null` | Any time after seeds are loaded; `null` before |
+| `applyCameraState(state)` | `void` | After `onStateChange` fires with `state === 'streaming'` |
+
+**Timing:** `applyCameraState` depends on the scene centroid set during seed loading. Calling before `state === 'streaming'` places the camera at the wrong position. See the [viewer README](packages/viewer/README.md#camera-control) for details.
+
+---
+
 ## Design
 
 ### No preprocessing required
