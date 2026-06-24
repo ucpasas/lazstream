@@ -229,6 +229,11 @@ export class StreamingEngine {
 
       this.buildSpatialIndex(seeds, header)
 
+      // Compute p1/p99 intensity range from seed points for shader-side stretch.
+      // Seeds are sorted (≤7073 values) so exact percentiles are trivial.
+      const intensitySeedRange = computeIntensitySeedRange(seeds)
+      console.debug('[lazstream] intensity seed range:', intensitySeedRange)
+
       this.emit('workers-init', `Starting ${this.workerCount} decode workers...`)
 
       this.workerPool = new WorkerPool({
@@ -247,7 +252,7 @@ export class StreamingEngine {
         throw new DOMException('Load aborted during worker init', 'AbortError')
       }
 
-      this.workerPool.configure(header, lazVlr)
+      this.workerPool.configure(header, lazVlr, intensitySeedRange)
       this.workersConfigured = true
 
       this.emit('streaming', `Streaming — ${this.workerCount} workers active`)
@@ -589,4 +594,15 @@ export class StreamingEngine {
       queuedChunks: this.workerPool?.queueLength ?? 0,
     })
   }
+}
+
+// ─── Module-local utility ────────────────────────────────────────────────────
+
+function computeIntensitySeedRange(seeds: SeedPoint[]): { lo: number; hi: number } {
+  if (seeds.length === 0) return { lo: 0, hi: 65535 }
+  const sorted = seeds.map(s => s.intensity).sort((a, b) => a - b)
+  const N  = sorted.length
+  const lo = sorted[Math.floor(0.01 * N)] ?? 0
+  const hi = sorted[Math.floor(0.99 * N)] ?? 65535
+  return { lo, hi: hi <= lo ? lo + 1 : hi }
 }

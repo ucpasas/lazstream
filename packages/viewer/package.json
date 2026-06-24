@@ -7,6 +7,10 @@
     ".": {
       "import": "./dist/index.js",
       "types":  "./dist/index.d.ts"
+    },
+    "./vite": {
+      "import": "./dist/vite-plugin.js",
+      "types":  "./dist/vite-plugin.d.ts"
     }
   },
   "main":  "./dist/index.js",
@@ -33,7 +37,11 @@
   },
   "peerDependencies": {
     "@lazstream/core": "^1.0.0",
-    "three": ">=0.168.0"
+    "three": ">=0.168.0",
+    "vite": ">=5.0.0"
+  },
+  "peerDependenciesMeta": {
+    "vite": { "optional": true }
   },
   "devDependencies": {
     "@lazstream/core": "workspace:*",

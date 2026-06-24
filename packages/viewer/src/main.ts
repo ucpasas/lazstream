@@ -5,7 +5,7 @@
  * All loading goes through ManifestSession — single files are wrapped in a
  * synthetic one-tile manifest so there is one code path for both cases.
  *
- * URL params:
+ * URL params (read ONCE at startup — never drive runtime state via URL navigation):
  *   ?url=<laz>         direct LAZ file (existing behaviour, unchanged)
  *   ?manifest=<lazm>   .lazm.json manifest (new)
  *   ?bufferMB=N        ring buffer size override
@@ -13,15 +13,21 @@
  *   ?workerCount=N     decode worker count
  *   ?maxFetches=N      max concurrent HTTP range requests
  *   ?splatRadius=N     point splat size in pixels
+ *   ?colorMode=<mode>  initial colour mode (dev convenience); overridden by #v= token if present
  *
  * URL fragment:
- *   #v=<base64url>     encoded ViewState (source + camera) — takes priority
- *                      over ?url= / ?manifest= for auto-load
+ *   #v=<base64url>     encoded ViewState (source + camera + colorMode) — takes priority
+ *                      over ?url= / ?manifest= for auto-load; updated on every mode switch
+ *                      via history.replaceState (no navigation, no re-stream)
+ *
+ * Colour mode switching (keyboard):
+ *   1 → rgb   2 → height   3 → intensity   4 → classification
  */
 
 import { ManifestSession, fetchManifest, urlToManifest, validateManifestUrl, getEntryFromParams, encodeViewState, decodeViewState, CorsError } from '@lazstream/core'
 import type { ManifestSessionOptions, Manifest, CameraState } from '@lazstream/core'
 import { WebGPURenderer, WebGPUUnsupportedError } from './render/webgpu-renderer.js'
+import type { ColorMode } from './render/webgpu-renderer.js'
 // ?worker&url: Vite compiles decode-worker.ts as a module worker and returns its
 // URL — hashed JS in prod, dev-server URL in dev. Bypasses the @vite-ignore default
 // in WorkerPool so the viewer never relies on the fallback path.
@@ -94,6 +100,7 @@ async function main(): Promise<void> {
   // Takes priority over ?url= / ?manifest= for auto-load.
 
   let pendingCamState: CameraState | null = null
+  let pendingColorMode: ColorMode | null = null
   let hashSource: string | null = null
 
   const hashMatch = window.location.hash.slice(1).match(/(?:^|&)v=([^&]+)/)
@@ -102,9 +109,17 @@ async function main(): Promise<void> {
       const vs = decodeViewState(hashMatch[1])
       hashSource = vs.source
       pendingCamState = vs.cam
+      if (vs.colorMode) pendingColorMode = vs.colorMode as ColorMode
     } catch {
       console.warn('[lazstream] Invalid #v= token — ignoring')
     }
+  }
+
+  // Fallback: ?colorMode= is a startup-only convenience param.
+  // It is read once here and never again — never navigate to switch modes.
+  if (!pendingColorMode) {
+    const paramMode = urlParams.get('colorMode')
+    if (paramMode) pendingColorMode = paramMode as ColorMode
   }
 
   // ─── Error display ────────────────────────────────────────────────────────
@@ -130,6 +145,24 @@ async function main(): Promise<void> {
   // ─── Current source URL (for share button) ────────────────────────────────
 
   let currentSourceUrl: string | null = null
+
+  // Write the current view state (source + camera + colorMode) into the URL
+  // fragment via replaceState — no navigation, no re-stream, link stays shareable.
+  function replaceViewStateHash(): void {
+    if (!currentSourceUrl) return
+    const token = encodeViewState({
+      source: currentSourceUrl,
+      cam: renderer.getCameraState(),
+      colorMode: renderer.currentColorMode,
+    })
+    history.replaceState(null, '', '#v=' + token)
+  }
+
+  // Switch colour mode, update the #v= hash, no re-stream.
+  function applyColorMode(mode: ColorMode): void {
+    renderer.setColorMode(mode)
+    replaceViewStateHash()
+  }
 
   // Acquire the WebGPU renderer — fails fast if WebGPU is unavailable
   let renderer: WebGPURenderer
@@ -167,14 +200,25 @@ async function main(): Promise<void> {
 
   shareBtn.addEventListener('click', () => {
     if (!currentSourceUrl) return
-    const token = encodeViewState({ source: currentSourceUrl, cam: renderer.getCameraState() })
-    history.replaceState(null, '', '#v=' + token)
+    replaceViewStateHash()
     navigator.clipboard.writeText(window.location.href).then(() => {
       shareBtn.textContent = 'Copied!'
       setTimeout(() => { shareBtn.textContent = 'Share' }, 2000)
     }).catch(() => {
       // Clipboard permission denied — hash is still updated so user can copy manually
     })
+  })
+
+  // ─── Keyboard shortcuts ───────────────────────────────────────────────────
+  // 1–4 switch colour modes without reloading. Updates #v= hash via replaceState.
+
+  document.addEventListener('keydown', (e) => {
+    if ((e.target as HTMLElement).tagName === 'INPUT') return
+    const modeMap: Record<string, ColorMode> = {
+      '1': 'rgb', '2': 'height', '3': 'intensity', '4': 'classification',
+    }
+    const mode = modeMap[e.key]
+    if (mode) applyColorMode(mode)
   })
 
   // ─── Active session (one at a time) ──────────────────────────────────────
@@ -239,6 +283,12 @@ async function main(): Promise<void> {
 
         onSeedsReady(seeds, header) {
           renderer.loadSeedPoints(seeds, header)
+          // Apply colour mode from #v= or ?colorMode= (read once at startup above).
+          // loadSeedPoints already set the file-derived default; override it if we have one.
+          if (pendingColorMode) {
+            renderer.setColorMode(pendingColorMode)
+            pendingColorMode = null
+          }
           // Restore camera from shared URL, or auto-fit to the file's bbox.
           // Both must be called after loadSeedPoints() which sets sceneCenter.
           if (pendingCamState) {

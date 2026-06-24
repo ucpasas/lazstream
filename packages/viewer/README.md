@@ -59,6 +59,7 @@ Pass options to `LazstreamViewer.create(canvas, options)`.
 | `ringBufferCapacity` | adapter-negotiated (~2 GB) | GPU memory for decoded points. More = more simultaneous chunks visible. |
 | `splatRadius` | `2` | Point size: `1`=1 px, `2`=3×3 px, `3`=5×5 px. |
 | `assetUrls` | auto | Override laz-perf WASM/worker URLs for CDN or custom hosting. |
+| `colorMode` | file-derived | Initial colour mode: `'rgb'` \| `'height'` \| `'intensity'` \| `'classification'`. Defaults to `'rgb'` if the file has native colour, else `'height'`. |
 | `onStateChange` | — | `(state: string, message?: string) => void` |
 | `onProgress` | — | `(loaded: number, total: number, phase: string) => void` |
 | `onWarning` | — | `(msg: string) => void` |
@@ -155,6 +156,63 @@ const renderer = await WebGPURenderer.create(canvas, {
 | `edlStrength` | `600` | Shading intensity. `0` disables EDL. `1000+` may posterise flat surfaces. |
 | `edlRadius` | `1` | Depth-sampling radius in pixels. `1`–`2` is the practical range. |
 | `splatRadius` | `2` | Point splat size (see above). |
+
+---
+
+## Colour modes
+
+lazstream renders point clouds in four colour modes. Switching is instant — no re-decode, no re-stream, just a GPU uniform flip.
+
+| Mode | Description |
+|------|-------------|
+| `'rgb'` | Native colour from the LAZ file. Only available for PDRFs with colour (2, 3, 5, 7, 8, 10). |
+| `'height'` | Elevation ramp (green → yellow → red). Always available. Default when the file has no native colour. |
+| `'intensity'` | Greyscale intensity, normalised to the p1–p99 range of the seed point scan. Always available. |
+| `'classification'` | ASPRS classification palette (ground, vegetation, buildings, water, …). Always available. |
+
+```typescript
+import { LazstreamViewer } from '@lazstream/viewer'
+import type { ColorMode } from '@lazstream/viewer'
+
+const viewer = await LazstreamViewer.create(canvas)
+
+// React to mode changes (fires with the RESOLVED mode — 'rgb' may resolve
+// to 'height' if the file has no native colour)
+viewer.onColorModeChanged = (resolved: ColorMode) => {
+  console.log('active mode:', resolved)
+}
+
+await viewer.load(url)
+
+// Switch mode at runtime — no reload
+viewer.setColorMode('intensity')
+
+// Returns the resolved (active) mode
+console.log(viewer.colorMode)         // 'intensity'
+
+// Modes available for the loaded file ('rgb' absent for non-colour PDRFs)
+console.log(viewer.getAvailableColorModes())  // ['height', 'intensity', 'classification']
+```
+
+`setColorMode()` returns the resolved `ColorMode` and fires `onColorModeChanged` with the same value. If you request `'rgb'` on a file that has no native colour it silently resolves to `'height'`.
+
+### URL / view-state contract
+
+The **SDK** (`LazstreamViewer`) is URL-agnostic:
+
+- `setColorMode()` has no URL side effect.
+- `options.colorMode` is read once at `onSeedsReady` — the SDK never reads `window.location` or `history`.
+
+If you want the active mode to survive a page share, write it into the URL yourself after `onColorModeChanged` fires:
+
+```typescript
+viewer.onColorModeChanged = (resolved) => {
+  const token = encodeViewState({ source: url, cam: ..., colorMode: resolved })
+  history.replaceState(null, '', '#v=' + token)
+}
+```
+
+The built-in viewer app (`@lazstream/viewer` demo) already does this — the `#v=` hash includes `colorMode` and the `1`–`4` keyboard shortcuts switch modes without a page reload.
 
 ---
 

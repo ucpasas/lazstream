@@ -20,9 +20,11 @@ export default defineConfig(({ mode }) => {
     build: {
       outDir: isLib ? 'dist' : 'dist-app',
       lib: isLib ? {
-        entry: resolve(__dirname, 'src/index.ts'),
+        entry: {
+          index: resolve(__dirname, 'src/index.ts'),
+          'vite-plugin': resolve(__dirname, 'src/vite-plugin.ts'),
+        },
         formats: ['es'],
-        fileName: 'index',
       } : undefined,
       rolldownOptions: isLib ? {
         external: ['three', /^three\//, '@lazstream/core'],

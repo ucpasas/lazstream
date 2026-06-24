@@ -21,10 +21,11 @@ import type {
   CameraState,
 } from '@lazstream/core'
 import { WebGPURenderer, WebGPUUnsupportedError } from './render/webgpu-renderer.js'
+import type { ColorMode } from './render/webgpu-renderer.js'
 import type { RawPick } from './render/picking.js'
 
 export { WebGPUUnsupportedError }
-export type { PointAttributes, CameraState }
+export type { PointAttributes, ColorMode, CameraState }
 
 /**
  * Resolved pick result exposed to application code.
@@ -52,9 +53,13 @@ export interface ViewerOptions {
   /** Point splat radius in pixels. Default: 2 (3 × 3 px). */
   splatRadius?: number
   /**
-   * Asset URL overrides for non-standard hosting (CDN prefix, custom hashes).
-   * The viewer passes these through to ManifestSession → WorkerPool.
-   * In dev mode the viewer automatically points to /lib/ so this is rarely needed.
+   * Asset URL overrides for laz-perf worker assets.
+   * Passed through to ManifestSession → WorkerPool.
+   * Defaults: WorkerPool resolves assets relative to its own module via import.meta.url,
+   * which works correctly when @lazstream/core is installed from npm and not pre-bundled
+   * by Vite. Add `lazstreamVitePlugin()` to your vite.config.ts to ensure this.
+   * For non-Vite bundlers, pass explicit URLs pointing at the assets from
+   * node_modules/@lazstream/core/dist/.
    */
   assetUrls?: LazstreamAssetUrls
   /**
@@ -63,6 +68,8 @@ export interface ViewerOptions {
    * Adds a few ms per click for the chunk re-decode. Default: false.
    */
   resolveAttributes?: boolean
+  /** Initial colour mode. Default: 'rgb' if the file has native colour, else 'height'. */
+  colorMode?: ColorMode
   onStateChange?: EngineEvents['onStateChange']
   onProgress?: EngineEvents['onProgress']
   onWarning?: EngineEvents['onWarning']
@@ -81,6 +88,14 @@ export class LazstreamViewer {
    * Set onPointPicked before calling setPickingEnabled(true).
    */
   onPointPicked: ((result: PickResult | null) => void) | null = null
+
+  /**
+   * Fires after every setColorMode() call with the RESOLVED mode.
+   * The resolved mode may differ from the requested mode (e.g. 'rgb' resolves
+   * to 'height' when the file has no native colour). Always reflects the mode
+   * that is actually active on the GPU.
+   */
+  onColorModeChanged: ((resolved: ColorMode) => void) | null = null
 
   private constructor(renderer: WebGPURenderer, options: ViewerOptions) {
     this.renderer = renderer
@@ -133,13 +148,6 @@ export class LazstreamViewer {
 
     const { workerCount, sseThreshold, maxFetches, assetUrls } = this.options
 
-    // In dev mode (Vite serves laz-perf from /lib/), default assetUrls to the
-    // public/lib/ paths so WorkerPool's import.meta.url fallback isn't used.
-    const resolvedAssetUrls: LazstreamAssetUrls = assetUrls ?? {
-      lazPerfJsUrl:   new URL('/lib/laz-perf-worker.js',   location.href).href,
-      lazPerfWasmUrl: new URL('/lib/laz-perf-worker.wasm', location.href).href,
-    }
-
     const sessionOptions: ManifestSessionOptions = {
       events: {
         onStateChange: this.options.onStateChange,
@@ -149,6 +157,11 @@ export class LazstreamViewer {
         onError:       this.options.onError,
         onSeedsReady: (seeds, header) => {
           this.renderer.loadSeedPoints(seeds, header)
+          // Apply initial colour mode from ViewerOptions if provided (consumer owns URL sync).
+          if (this.options.colorMode) {
+            const resolved = this.renderer.setColorMode(this.options.colorMode)
+            this.onColorModeChanged?.(resolved)
+          }
           this.startDecodeLoop(session)
         },
         onChunkDecoded: (chunk) => {
@@ -158,7 +171,7 @@ export class LazstreamViewer {
       workerCount,
       sseThreshold,
       maxFetches,
-      assetUrls: resolvedAssetUrls,
+      assetUrls,
     }
 
     const session = new ManifestSession(manifest, sessionOptions)
@@ -227,6 +240,31 @@ export class LazstreamViewer {
     } else {
       this.renderer.onPointPicked = null
     }
+  }
+
+  /**
+   * Switch the colour mode. No re-decode — just a uniform flip, takes effect next frame.
+   * Modes: 'rgb' (native), 'height' (elevation ramp), 'intensity' (grayscale),
+   * 'classification' (ASPRS palette).
+   *
+   * Returns the RESOLVED mode. If 'rgb' is requested on a file without native colour,
+   * it silently resolves to 'height'. The onColorModeChanged callback always fires with
+   * the resolved mode.
+   */
+  setColorMode(mode: ColorMode): ColorMode {
+    const resolved = this.renderer.setColorMode(mode)
+    this.onColorModeChanged?.(resolved)
+    return resolved
+  }
+
+  /** Returns which colour modes are available for the loaded file. 'rgb' is absent for PDRFs without colour. */
+  getAvailableColorModes(): ColorMode[] {
+    return this.renderer.getAvailableColorModes()
+  }
+
+  /** Current colour mode. */
+  get colorMode(): ColorMode {
+    return this.renderer.currentColorMode
   }
 
   /**
