@@ -158,6 +158,41 @@ const renderer = await WebGPURenderer.create(canvas, {
 
 ---
 
+## Camera control
+
+Read and drive the camera from external code — useful for map sync, animation, bookmarks, and tour playback.
+
+```typescript
+import { LazstreamViewer } from '@lazstream/viewer'
+import type { CameraState } from '@lazstream/viewer'
+
+const viewer = await LazstreamViewer.create(canvas, {
+  onStateChange(state) {
+    if (state === 'streaming') {
+      // Safe to call applyCameraState now — seed points are loaded and
+      // sceneCenter is set. Calling earlier places the camera incorrectly.
+      viewer.applyCameraState(savedState)
+    }
+  },
+})
+await viewer.load(url)
+
+// Read the current camera at any time after seeds are loaded
+const state: CameraState | null = viewer.getCameraState()
+// { x, y, z, tx, ty, tz, fovY } — world coordinates (e.g. MGA55 projected)
+```
+
+| Method | Returns | Notes |
+|--------|---------|-------|
+| `getCameraState()` | `CameraState \| null` | `null` before seeds are loaded |
+| `applyCameraState(state)` | `void` | Must be called after seeds are loaded (state `'streaming'`) |
+
+`CameraState` is exported directly from `@lazstream/viewer` — no `@lazstream/core` import needed.
+
+**Timing constraint:** `applyCameraState` uses the scene centroid (`sceneCenter`) set during seed loading to convert world coordinates to scene-local. Calling it before seeds are ready means `sceneCenter` is still zero and the camera lands at the wrong position.
+
+---
+
 ## Accessing the underlying session
 
 ```typescript
