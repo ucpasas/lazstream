@@ -1,3 +1,11 @@
+## 1.3.1 — 2026-06-26
+
+### Fixed
+- `CameraState` type is now correctly re-exported from the package root
+  (`@lazstream/viewer`). Previously it was exported from `viewer.d.ts` but
+  missing from `index.ts`, causing a runtime `SyntaxError` for consumers
+  importing it directly from `@lazstream/viewer`.
+
 ## 1.3.0 — 2026-06-22
 
 ### Added
