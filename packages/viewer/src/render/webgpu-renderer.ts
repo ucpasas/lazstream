@@ -217,6 +217,11 @@ export class WebGPURenderer {
   private readonly cullFrustum = new THREE.Frustum()
   private readonly cullSlotBox = new THREE.Box3()
 
+  // Scratch for isWorldBBoxVisible() — kept separate from the render cull's
+  // scratch so a mid-frame diagnostic call can't corrupt an in-flight cull.
+  private readonly benchFrustum = new THREE.Frustum()
+  private readonly benchBox = new THREE.Box3()
+
   // Color mode
   private colorMode: ColorMode = 'height'
   private hasRGB = false
@@ -980,6 +985,28 @@ export class WebGPURenderer {
     }
 
     return { minX, minY, minZ, maxX, maxY, maxZ }
+  }
+
+  /**
+   * Exact 6-plane frustum vs world-space AABB test against the current
+   * camera. Diagnostic/benchmark use (camera-bench wasted-fetch metric) —
+   * same plane-vs-box test as the per-slot render cull, so "visible" here
+   * matches what the compute pass would actually draw.
+   */
+  isWorldBBoxVisible(bbox: BBox3D): boolean {
+    // viewProj is scene-local (see cull in renderFrame); convert the box.
+    this.benchFrustum.setFromProjectionMatrix(this.viewProj)
+    this.benchBox.min.set(
+      bbox.minX - this.sceneCenter.x,
+      bbox.minY - this.sceneCenter.y,
+      bbox.minZ - this.sceneCenter.z,
+    )
+    this.benchBox.max.set(
+      bbox.maxX - this.sceneCenter.x,
+      bbox.maxY - this.sceneCenter.y,
+      bbox.maxZ - this.sceneCenter.z,
+    )
+    return this.benchFrustum.intersectsBox(this.benchBox)
   }
 
   /** Return the current camera state in world coordinates for view-state sharing. */

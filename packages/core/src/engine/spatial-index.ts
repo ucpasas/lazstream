@@ -45,6 +45,30 @@ export interface SeedXYZ {
   z: number
 }
 
+/**
+ * Conservative per-chunk half-extents for seed-estimate bboxes.
+ * Shared by buildFromSeeds() and the octree ordering path in
+ * ChunkPrioritiser (which inflates its frustum query by these values) so
+ * the two estimates can never diverge.
+ *
+ * XY: square side from total-area / chunk-count, padded 1.5×.
+ * Z:  half the file's full Z range (generous for aerial tiled data,
+ *     roughly tight for terrestrial scans).
+ */
+export function seedEstimateHalfExtents(
+  seedCount: number,
+  fileBBox: BBox3D,
+): { xyHalf: number; zHalf: number } {
+  const xyArea = Math.max(
+    1,
+    (fileBBox.maxX - fileBBox.minX) * (fileBBox.maxY - fileBBox.minY),
+  )
+  return {
+    xyHalf: Math.sqrt(xyArea / Math.max(1, seedCount)) * 1.5 * 0.5,
+    zHalf: (fileBBox.maxZ - fileBBox.minZ) * 0.5,
+  }
+}
+
 /** What updateFromDecoded() needs from a decoded chunk. Subset of DecodedChunk. */
 export interface DecodedBBox3D {
   chunkIndex: number
@@ -82,17 +106,7 @@ export class SpatialIndex {
 
     if (seeds.length === 0) return
 
-    // XY footprint: square side from total-area / chunk-count, padded 1.5×.
-    const xyArea = Math.max(
-      1,
-      (fileBBox.maxX - fileBBox.minX) * (fileBBox.maxY - fileBBox.minY),
-    )
-    const xyHalf = Math.sqrt(xyArea / seeds.length) * 1.5 * 0.5
-
-    // Z extent: half the file's full Z range, centred on the seed Z.
-    // Generous for aerial tiled data (XY-tiled, Z-unsorted within tile);
-    // roughly tight for terrestrial scans which tend to span most of Z anyway.
-    const zHalf = (fileBBox.maxZ - fileBBox.minZ) * 0.5
+    const { xyHalf, zHalf } = seedEstimateHalfExtents(seeds.length, fileBBox)
 
     const entries: RBush3DEntry[] = seeds.map(s => ({
       minX: s.x - xyHalf,

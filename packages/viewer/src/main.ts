@@ -14,6 +14,11 @@
  *   ?maxFetches=N      max concurrent HTTP range requests
  *   ?splatRadius=N     point splat size in pixels
  *   ?colorMode=<mode>  initial colour mode (dev convenience); overridden by #v= token if present
+ *   ?order=<mode>      decode queue ordering: sse (default) | hilbert | octree (spike)
+ *   ?exactCull=0       disable the exact 6-plane dispatch gate (on by default;
+ *                      opt-out retained for A/B benchmarking of the loose AABB path)
+ *   ?bench=<path>      scripted camera benchmark: pan | jump (spike; pairs with ?order=)
+ *   ?benchHold=N       ms to hold before the benchmark move starts (default 8000)
  *
  * URL fragment:
  *   #v=<base64url>     encoded ViewState (source + camera + colorMode) — takes priority
@@ -25,7 +30,8 @@
  */
 
 import { ManifestSession, fetchManifest, urlToManifest, validateManifestUrl, getEntryFromParams, encodeViewState, decodeViewState, CorsError } from '@lazstream/core'
-import type { ManifestSessionOptions, Manifest, CameraState } from '@lazstream/core'
+import type { ManifestSessionOptions, Manifest, CameraState, ChunkOrdering } from '@lazstream/core'
+import type { CameraBench } from './dev/camera-bench.js'
 import { WebGPURenderer, WebGPUUnsupportedError } from './render/webgpu-renderer.js'
 import type { ColorMode } from './render/webgpu-renderer.js'
 // ?worker&url: Vite compiles decode-worker.ts as a module worker and returns its
@@ -82,6 +88,20 @@ async function main(): Promise<void> {
     splatRadiusParam !== null && Number.isFinite(parseInt(splatRadiusParam, 10))
       ? Math.max(1, parseInt(splatRadiusParam, 10))
       : undefined
+
+  const orderParam = urlParams.get('order')
+  const chunkOrdering: ChunkOrdering | undefined =
+    orderParam === 'sse' || orderParam === 'hilbert' || orderParam === 'octree'
+      ? orderParam
+      : undefined
+  if (orderParam && !chunkOrdering) {
+    console.warn(`[lazstream] unknown ?order=${orderParam} — using default 'sse'`)
+  }
+
+  // Default ON — measured on Melbourne 2018 (see wiki spike page): the exact
+  // gate cuts post-settle wasted fetch from ~81-100% to ~8-19% and breaks the
+  // perpetual decode→evict→re-queue churn at ground-level views.
+  const exactCull = urlParams.get('exactCull') !== '0'
 
   // ─── Fetch-timing diagnostic (dev-only, tree-shaken when ?timing absent) ──
 
@@ -164,6 +184,11 @@ async function main(): Promise<void> {
     replaceViewStateHash()
   }
 
+  // Active session (one at a time). Declared before the renderer: onFrame
+  // fires from the render loop during the async setup below, and a `let`
+  // further down would still be in its temporal dead zone at that point.
+  let activeSession: ManifestSession | null = null
+
   // Acquire the WebGPU renderer — fails fast if WebGPU is unavailable
   let renderer: WebGPURenderer
   try {
@@ -186,6 +211,25 @@ async function main(): Promise<void> {
   }
 
   if (splatRadius !== undefined) renderer.setSplatRadius(splatRadius)
+
+  // ─── Camera-path benchmark (dev-only, spike) ──────────────────────────────
+
+  let cameraBench: CameraBench | null = null
+  const benchParam = urlParams.get('bench')
+  if (benchParam === 'pan' || benchParam === 'jump') {
+    const benchHoldParam = urlParams.get('benchHold')
+    const benchHold =
+      benchHoldParam !== null && Number.isFinite(parseInt(benchHoldParam, 10))
+        ? Math.max(0, parseInt(benchHoldParam, 10))
+        : undefined
+    const { installCameraBench } = await import('./dev/camera-bench.js')
+    cameraBench = installCameraBench({
+      renderer,
+      path: benchParam,
+      order: chunkOrdering ?? 'sse',
+      holdMs: benchHold,
+    })
+  }
 
   renderer.onPointPicked = async (pick) => {
     console.log('[pick]', pick)
@@ -220,10 +264,6 @@ async function main(): Promise<void> {
     const mode = modeMap[e.key]
     if (mode) applyColorMode(mode)
   })
-
-  // ─── Active session (one at a time) ──────────────────────────────────────
-
-  let activeSession: ManifestSession | null = null
 
   // ─── Session factory ──────────────────────────────────────────────────────
 
@@ -298,11 +338,13 @@ async function main(): Promise<void> {
             renderer.fitCameraToHeader(header)
           }
           shareBtn.disabled = false
+          cameraBench?.notifySeedsReady(header)
         },
 
         onChunkDecoded(chunk) {
           renderer.addDecodedChunk(chunk)
           decodeTimingListener?.(chunk)
+          cameraBench?.notifyChunkDecoded(chunk)
         },
 
         onError(error) {
@@ -312,6 +354,7 @@ async function main(): Promise<void> {
       workerCount,
       sseThreshold,
       maxFetches,
+      chunkOrdering,
       assetUrls: {
         workerUrl:      decodeWorkerUrl,
         lazPerfJsUrl:   new URL('/lib/laz-perf-worker.js',   location.href).href,
@@ -334,7 +377,11 @@ async function main(): Promise<void> {
 
     session.setFrustumProvider(() => renderer.getFrustumWorldBBox3D())
     session.setRingBufferProvider(() => renderer.getRingBufferStatus())
-    renderer.setChunkEvictedCallback(chunkIndex => session.onChunkEvictedFromGPU(chunkIndex))
+    if (exactCull) session.setVisibilityProvider(bbox => renderer.isWorldBBoxVisible(bbox))
+    renderer.setChunkEvictedCallback(chunkIndex => {
+      session.onChunkEvictedFromGPU(chunkIndex)
+      cameraBench?.notifyChunkEvicted(chunkIndex)
+    })
 
     activeSession = session
     return session

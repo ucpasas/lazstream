@@ -189,6 +189,11 @@ export class LazstreamViewer {
     })
     session.setFrustumProvider(() => this.renderer.getFrustumWorldBBox3D())
     session.setRingBufferProvider(() => this.renderer.getRingBufferStatus())
+    // Exact-plane visibility gate: without it, ground-level views churn
+    // (decode → exact-cull evict → re-queue) on chunks only the loose
+    // frustum AABB admits. Measured on Melbourne 2018: post-settle wasted
+    // fetch drops from ~81-100% to ~8-19%. See wiki spike page.
+    session.setVisibilityProvider(bbox => this.renderer.isWorldBBoxVisible(bbox))
     this.renderer.setChunkEvictedCallback(idx => session.onChunkEvictedFromGPU(idx))
 
     await session.load()

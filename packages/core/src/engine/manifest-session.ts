@@ -26,7 +26,7 @@ import type { EngineEvents, RingBufferProvider, StreamingEngineOptions } from '.
 import type { Manifest } from './manifest-types.js'
 import type { LasHeader, SeedPoint, PointAttributes } from '../types/las.js'
 import type { BBox3D } from '../types/spatial.js'
-import type { CameraInfo } from '../decode/chunk-priority.js'
+import type { CameraInfo, VisibilityTest } from '../decode/chunk-priority.js'
 import type { DecodedChunk } from '../decode/worker-pool.js'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -45,6 +45,7 @@ export class ManifestSession {
   private cameraProvider: (() => CameraInfo) | null = null
   private frustumProvider: (() => BBox3D) | null = null
   private ringBufferProvider: RingBufferProvider | null = null
+  private visibilityProvider: VisibilityTest | null = null
 
   constructor(
     private readonly manifest: Manifest,
@@ -67,6 +68,12 @@ export class ManifestSession {
   setRingBufferProvider(provider: RingBufferProvider): void {
     this.ringBufferProvider = provider
     for (const e of this.engines) e.setRingBufferProvider(provider)
+  }
+
+  /** Register exact-visibility test — forwarded to all tile engines. */
+  setVisibilityProvider(provider: VisibilityTest): void {
+    this.visibilityProvider = provider
+    for (const e of this.engines) e.setVisibilityProvider(provider)
   }
 
   /**
@@ -116,7 +123,7 @@ export class ManifestSession {
    */
   async load(): Promise<void> {
     const { tiles } = this.manifest
-    const { events, workerCount, sseThreshold, maxFetches, cache, assetUrls } = this.options
+    const { events, workerCount, sseThreshold, maxFetches, cache, assetUrls, chunkOrdering } = this.options
     const tileCount = tiles.length
 
     // Distribute the total worker budget evenly across tiles.
@@ -192,12 +199,14 @@ export class ManifestSession {
         sseThreshold,
         maxFetches,
         assetUrls,
+        chunkOrdering,
       })
 
       // Register providers that were set before load()
       if (this.cameraProvider)   engine.setCameraProvider(this.cameraProvider)
       if (this.frustumProvider)  engine.setFrustumProvider(this.frustumProvider)
       if (this.ringBufferProvider) engine.setRingBufferProvider(this.ringBufferProvider)
+      if (this.visibilityProvider) engine.setVisibilityProvider(this.visibilityProvider)
 
       // Wire the eviction callback: renderer calls session.onChunkEvictedFromGPU
       // which routes here. We DON'T use setChunkEvictedCallback on each engine
