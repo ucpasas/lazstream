@@ -28,6 +28,12 @@ export interface WebGPUContext {
   canvasFormat: GPUTextureFormat
   /** Point-data ring buffer size in bytes — negotiated from adapter limits. */
   ringBufferCapacity: number
+  /** True when the device was created with the 'timestamp-query' feature.
+   *  Absence disables GPU pass timing (?gputiming=1) — never fails creation. */
+  hasTimestampQuery: boolean
+  /** True when the device was created with the 'subgroups' feature.
+   *  Enables the same-pixel dedup shader variant (?sgdedup=1). */
+  hasSubgroups: boolean
   /** Diagnostic info for the stats overlay / debug. */
   limits: {
     adapterMaxStorageBufferBindingSize: number
@@ -121,12 +127,19 @@ export async function createWebGPUContext(
   const requestedStorage = Math.min(adapterMaxStorage, target)
   const requestedBuffer  = Math.min(adapterMaxBuffer,  target)
 
+  // Optional features: request only what the adapter advertises. Absence must
+  // not fail device creation — the dependent paths silently disable instead.
+  const requiredFeatures: GPUFeatureName[] = []
+  if (adapter.features.has('timestamp-query')) requiredFeatures.push('timestamp-query')
+  if (adapter.features.has('subgroups')) requiredFeatures.push('subgroups' as GPUFeatureName)
+
   // Try requesting the negotiated limits. If the device refuses (rare but
   // possible — e.g. driver quirks, GPU process restrictions), fall back to
   // the default device which gives us the conservative ~128 MB limits.
   let device: GPUDevice
   try {
     device = await adapter.requestDevice({
+      requiredFeatures,
       requiredLimits: {
         maxStorageBufferBindingSize: requestedStorage,
         maxBufferSize:               requestedBuffer,
@@ -139,6 +152,9 @@ export async function createWebGPUContext(
     )
     device = await adapter.requestDevice()
   }
+
+  const hasTimestampQuery = device.features.has('timestamp-query')
+  const hasSubgroups      = device.features.has('subgroups')
 
   // What the DEVICE actually granted. This is the ceiling we work with;
   // anything larger would cause buffer allocation to fail validation.
@@ -193,6 +209,8 @@ export async function createWebGPUContext(
     canvas,
     canvasFormat,
     ringBufferCapacity,
+    hasTimestampQuery,
+    hasSubgroups,
     limits: {
       adapterMaxStorageBufferBindingSize: adapterMaxStorage,
       adapterMaxBufferSize:               adapterMaxBuffer,

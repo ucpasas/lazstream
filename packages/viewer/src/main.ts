@@ -19,6 +19,19 @@
  *                      opt-out retained for A/B benchmarking of the loose AABB path)
  *   ?bench=<path>      scripted camera benchmark: pan | jump (spike; pairs with ?order=)
  *   ?benchHold=N       ms to hold before the benchmark move starts (default 8000)
+ *   ?gputiming=1       per-pass GPU timestamp instrumentation (clear/depth/resolve),
+ *                      rolling avg/max logged 1/s; needs 'timestamp-query' support
+ *   ?adaptiveSplat=0   disable adaptive splats (ON by default: splats shrink to
+ *                      1×1 where chunk density exceeds pixel density — measured
+ *                      23%–3× depth-pass win, pixel-identical; opt-out for A/B)
+ *   ?sgdedup=1         subgroup same-pixel dedup shader variant (spike; needs
+ *                      the 'subgroups' WebGPU feature)
+ *   ?voxelLod=1        runtime voxel LOD "sediment layer" (Stage 5 spike):
+ *                      over-covered chunks render a persistent per-chunk voxel
+ *                      list instead of all points; voxels survive eviction
+ *   ?voxelGrid=N       voxel grid resolution per chunk axis (default 64)
+ *   ?voxelPoolMB=N     voxel sediment pool size (default min(128, ring/8) MB)
+ *   ?voxelPx=X         voxel switch-in threshold, projected px/cell (default 0.8)
  *
  * URL fragment:
  *   #v=<base64url>     encoded ViewState (source + camera + colorMode) — takes priority
@@ -97,6 +110,9 @@ async function main(): Promise<void> {
   if (orderParam && !chunkOrdering) {
     console.warn(`[lazstream] unknown ?order=${orderParam} — using default 'sse'`)
   }
+
+  // ?gputiming=1 — Stage 0 of the renderer performance roadmap (wiki).
+  const gpuTiming = urlParams.has('gputiming') && urlParams.get('gputiming') !== '0'
 
   // Default ON — measured on Melbourne 2018 (see wiki spike page): the exact
   // gate cuts post-settle wasted fetch from ~81-100% to ~8-19% and breaks the
@@ -192,8 +208,31 @@ async function main(): Promise<void> {
   // Acquire the WebGPU renderer — fails fast if WebGPU is unavailable
   let renderer: WebGPURenderer
   try {
+    const voxelGridParam = urlParams.get('voxelGrid')
+    const voxelGrid =
+      voxelGridParam !== null && Number.isFinite(parseInt(voxelGridParam, 10))
+        ? Math.max(8, Math.min(128, parseInt(voxelGridParam, 10)))
+        : undefined
+
+    const voxelPoolMBParam = urlParams.get('voxelPoolMB')
+    const voxelPoolBytes =
+      voxelPoolMBParam !== null && Number.isFinite(parseFloat(voxelPoolMBParam))
+        ? Math.floor(parseFloat(voxelPoolMBParam) * 1024 * 1024)
+        : undefined
+    const voxelPxParam = urlParams.get('voxelPx')
+    const voxelSwitchPx =
+      voxelPxParam !== null && Number.isFinite(parseFloat(voxelPxParam))
+        ? parseFloat(voxelPxParam)
+        : undefined
+
     renderer = await WebGPURenderer.create(canvas, {
       ringBufferCapacity,
+      gpuTiming,
+      subgroupDedup: urlParams.get('sgdedup') === '1',
+      voxelLod: urlParams.get('voxelLod') === '1',
+      voxelGrid,
+      voxelPoolBytes,
+      voxelSwitchPx,
       onFrame({ slots, pointsLoaded }) {
         statsEl.textContent =
           `${slots} chunks · ${pointsLoaded.toLocaleString()} pts`
@@ -211,6 +250,10 @@ async function main(): Promise<void> {
   }
 
   if (splatRadius !== undefined) renderer.setSplatRadius(splatRadius)
+  if (urlParams.get('adaptiveSplat') === '0') renderer.setAdaptiveSplat(false)
+
+  // Dev handle for scripted benches / console debugging (not part of the SDK).
+  ;(window as unknown as Record<string, unknown>).__lazstream = { renderer }
 
   // ─── Camera-path benchmark (dev-only, spike) ──────────────────────────────
 
