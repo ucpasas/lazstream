@@ -4,7 +4,7 @@
 // color work is O(pixels), not O(points)), and writes to the swapchain
 // texture, applying eye-dome lighting (EDL) inline.
 //
-// Color resolution: the pick-ID encodes (uniformIdx << 19 | localPointIndex).
+// Color resolution: the pick-ID encodes (uniformIdx << 18 | localPointIndex).
 // chunks[uniformIdx].pointStrideOffset locates the chunk in the ring buffer;
 // the point's hot word 1 (z + intensity8 + classification) sits at
 // strideOffset + local*2 + 1, and its cold RGBA word at
@@ -98,8 +98,8 @@ fn resolveColor(pickId: u32) -> vec3<f32> {
         // Depth hit but no pick-ID (transient benign-race window) — neutral gray.
         return vec3<f32>(0.5, 0.5, 0.5);
     }
-    let uniformIdx = pickId >> 19u;
-    let localIdx   = pickId & 0x7FFFFu;
+    let uniformIdx = pickId >> 18u;
+    let localIdx   = pickId & 0x3FFFFu;
     let chunk      = chunks[uniformIdx];
 
     let w1 = points[chunk.pointStrideOffset + localIdx * 2u + 1u];

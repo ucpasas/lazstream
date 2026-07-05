@@ -66,13 +66,24 @@ def compare(la, lb):
     print(f'--- {la} vs {lb} ---')
     for name, s in ((la, sa), (lb, sb)):
         if s:
+            per_mpt = s['depth_avg'] / s['end_mpts'] if s['end_mpts'] else float('nan')
             print(f'  {name:12s} tail: depth {s["depth_avg"]:.2f} ms  clear {s["clear_avg"]:.3f}  '
-                  f'@ {s["end_mpts"]:.1f}M pts / {s["end_slots"]} slots ({s["lines"]} lines)')
+                  f'@ {s["end_mpts"]:.1f}M pts / {s["end_slots"]} slots '
+                  f'({per_mpt*1000:.1f} us/Mpt, {s["lines"]} lines)')
         else:
             print(f'  {name:12s} NO DATA')
             return
     canary = sa['clear_avg'] / sb['clear_avg'] if sb['clear_avg'] else float('nan')
-    print(f'  clear-pass canary ratio: {canary:.2f} (should be ~1.0 for a fair pair)')
+    # Perf-state gate (wiki Renderer Performance Roadmap): the GPU sits in one
+    # of two clock states per browser launch, ~2.7x apart. Pairs are only
+    # interpretable at canary parity. And once a variant makes the frame very
+    # light, the canary itself becomes the measurement (power state follows
+    # workload) — then report the visible-point workload as the primary metric.
+    verdict = 'FAIR' if 0.9 <= canary <= 1.1 else 'UNFAIR — rerun until canary parity'
+    print(f'  clear-pass canary ratio: {canary:.2f}  [{verdict}]')
+    wl = sa['end_mpts'] / sb['end_mpts'] if sb['end_mpts'] else float('nan')
+    print(f'  visible-point workload ratio: {wl:.3f}  '
+          f'(clock-independent; primary metric when workloads differ)')
     pairs = matched_compare(a, b)
     if pairs:
         tail = pairs[-10:]

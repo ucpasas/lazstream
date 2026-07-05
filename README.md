@@ -285,6 +285,12 @@ lazstream applies four culling stages in sequence. Each stage eliminates chunks 
 
 Point clouds have no triangles. Traditional vertex pipelines require one draw call per point (too slow) or complex instancing (limited). lazstream uses a WebGPU compute shader with `atomicMin` per screen pixel (the Schütz technique): all visible points across all loaded chunks compete for depth in parallel. This scales linearly with GPU throughput — 150M simultaneous points at 60 fps on discrete hardware.
 
+### Runtime voxel LOD — the sediment layer
+
+Raw LAZ has no octree, so lazstream derives its level-of-detail at runtime instead: every decoded chunk is voxelized on arrival (≤1 ms, from points that were fetched anyway) into a coarse-to-fine tier list ordered so that any prefix of it is a complete coarser voxelization. When a chunk covers few pixels, the renderer dispatches a distance-derived prefix — tens of thousands of points collapse to a few hundred sub-pixel voxels with no visible difference.
+
+The coarse tier is kept permanently in a dedicated GPU pool (~15 KB per chunk): when a chunk is evicted from the ring buffer, its voxel "ghost" keeps rendering. Explored regions never collapse back to single seed points — the file-wide silhouette densifies permanently as you explore (the *sediment layer*), and revisits show recognisable structure instantly while full chunks re-stream. Disable with `voxelLod: false` (SDK) or `?voxelLod=0` (viewer app).
+
 ### Eye-Dome Lighting — depth without normals
 
 Point clouds have no surface normals. lazstream uses Eye-Dome Lighting (Boucheny, 2009): a fullscreen pass that reads the depth buffer, samples 4 cardinal neighbours per pixel, and attenuates brightness by the log-depth difference. This gives visible shading at zero preprocessing cost. The shading is scale-invariant — the same settings work on a room-scale scan and a continent-scale survey.
@@ -301,7 +307,7 @@ Point clouds have no surface normals. lazstream uses Eye-Dome Lighting (Boucheny
 
 **First loads are network-bound.** Chunks stream in as HTTP range requests — only what the camera frames is fetched. But raw LAZ has no spatial hierarchy, so fully exploring a file means every chunk is eventually requested. A 40 MB file at 3–5 MB/s takes 10–11 seconds of total transfer time once all chunks have been visited. IDB caching (on by default) makes all subsequent views of the same file instant.
 
-**Binary LOD only.** Raw LAZ files store points in scan order, not spatial order. Each chunk is either a single seed point (the overview) or all 50 000–75 000 of its points (full resolution). There is no intermediate level of detail. Zooming in immediately loads full chunks. Files converted to COPC would support continuous progressive refinement, but lazstream currently cannot render COPC files (see below).
+**Network-side LOD is still binary.** Raw LAZ files store points in scan order, not spatial order, so each chunk must be *fetched* whole — either a single seed point (the overview) or the full 50 000–75 000-point download. The runtime voxel LOD (above) fills the gap on the GPU side — visited chunks render at intermediate detail and keep a persistent coarse ghost after eviction — but it cannot reduce first-visit bandwidth. Files converted to COPC would support progressive network refinement, but lazstream currently cannot render COPC files (see below).
 
 **COPC files do not render.** COPC uses LAZ 1.4 layered compression (compressor type 3), which is not supported by laz-perf 0.0.7. A COPC file will load — the header and chunk table parse correctly — but chunk decode fails silently and no points appear. Upgrading laz-perf and adding COPC hierarchy traversal is in the works.
 

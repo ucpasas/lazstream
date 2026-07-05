@@ -139,6 +139,11 @@ export class RingBufferAllocator {
     min: [number, number, number],
     range: [number, number, number],
     currentFrame: number,
+    /** Optional eviction filter for defrag-by-eviction: keys for which it
+     *  returns false are never chosen as LRU victims in this call. Used by
+     *  the voxel sediment pool to spend fine-tier cache entries before
+     *  touching permanent tier-0 sediment. */
+    canEvict?: (chunkIndex: number) => boolean,
   ): AllocateResult | null {
     if (byteLength % 4 !== 0) {
       throw new Error(`RingBufferAllocator: byteLength ${byteLength} not multiple of 4`)
@@ -192,7 +197,7 @@ export class RingBufferAllocator {
 
       // No contiguous gap large enough — evict the LRU non-visible slot to
       // create (and potentially coalesce) a larger free region.
-      const victimKey = this.findLRUEvictableKey(currentFrame)
+      const victimKey = this.findLRUEvictableKey(currentFrame, canEvict)
       if (victimKey === null) {
         // All remaining slots are visible this frame — can't evict.
         // Return the partial result so the caller can process the evictions
@@ -211,11 +216,15 @@ export class RingBufferAllocator {
     return -1
   }
 
-  private findLRUEvictableKey(currentFrame: number): number | null {
+  private findLRUEvictableKey(
+    currentFrame: number,
+    canEvict?: (chunkIndex: number) => boolean,
+  ): number | null {
     let victim: number | null = null
     let oldestFrame = Infinity
     for (const [key, slot] of this.slots) {
       if (slot.lastRenderedFrame >= currentFrame) continue
+      if (canEvict && !canEvict(key)) continue
       if (slot.lastRenderedFrame < oldestFrame) {
         oldestFrame = slot.lastRenderedFrame
         victim = key

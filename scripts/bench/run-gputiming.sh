@@ -14,6 +14,9 @@
 # Usage: run-gputiming.sh <label> <viewhash|default> <runtime_s> <resultsdir>
 #   viewhash: a #v= token (see wiki [[View State Sharing]]); "default" loads
 #             Melbourne via ?url= and the fitCameraToHeader overview.
+#             The three benchmark viewpoints are deterministic functions of
+#             the header bbox — regenerate tokens with make-viewpoints.py
+#             (writes viewpoints.json next to this script).
 #   SHOT=1   also captures a PNG screenshot at the end (shot-<label>.png).
 #
 # Analysis: scripts/bench/analyze-gputiming.py. IMPORTANT: the GPU sits in

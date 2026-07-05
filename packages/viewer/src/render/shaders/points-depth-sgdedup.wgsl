@@ -111,7 +111,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     if (!valid) { return; }
 
-    let encodedId = (uniformIdx << 19u) | pointIdx;
+    let encodedId = (uniformIdx << 18u) | pointIdx;
 
     var radius = i32(camera.splatRadius) - 1;
     if (camera.adaptiveSplat > 0.5) {

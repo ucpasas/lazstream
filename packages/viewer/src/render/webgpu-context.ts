@@ -57,16 +57,19 @@ const MIN_RING_BUFFER_BYTES = 128 * 1024 * 1024  // 128 MB
  * advertise `maxStorageBufferBindingSize` around 2 GB). Integrated GPUs
  * may grant less and the negotiation falls back gracefully.
  *
- * At 700 KB/slot this gives ~2994 slots — close to but under the
- * MAX_SLOTS=4096 cap on the uniform pool in webgpu-renderer.ts.
+ * At the ~600 KB average LAZ chunk this holds ~3400 resident chunks —
+ * comfortably under the MAX_SLOTS=16384 uniform pool in webgpu-renderer.ts
+ * (which also carries voxel sediment tier slots since Stage 5).
  */
 const DEFAULT_TARGET_RING_BUFFER_BYTES = 2 * 1024 * 1024 * 1024  // 2 GB
 
 /**
- * Hard ceiling on requested capacity. With slotBytes=700 KB, this gives
- * exactly MAX_SLOTS=4096 ring buffer slots — any larger would exceed the
- * uniform pool and chunks beyond slot 4096 would fail to allocate
- * uniforms. Requesting above this clamps silently with a warning.
+ * Hard ceiling on requested capacity. Historically MAX_SLOTS(4096)×700 KB —
+ * the uniform-pool bound under v1 fixed slots. The v2 variable-size
+ * allocator + MAX_SLOTS=16384 no longer bind at this size, but ~2.87 GB
+ * remains a safe cross-adapter bound for a single storage buffer binding
+ * (u32-addressable, under every observed maxStorageBufferBindingSize).
+ * Requesting above this clamps with a warning.
  */
 const MAX_RING_BUFFER_BYTES = 4096 * 700_000  // ~2.87 GB
 
@@ -94,9 +97,8 @@ export async function createWebGPUContext(
   }
   if (target > MAX_RING_BUFFER_BYTES) {
     console.warn(
-      `[webgpu] targetCapacityBytes ${target} exceeds MAX_SLOTS-aware ceiling ` +
-      `${MAX_RING_BUFFER_BYTES} (~2.87 GB); clamping. ` +
-      `To go higher, bump MAX_SLOTS in webgpu-renderer.ts first.`
+      `[webgpu] targetCapacityBytes ${target} exceeds ceiling ` +
+      `${MAX_RING_BUFFER_BYTES} (~2.87 GB); clamping.`
     )
     target = MAX_RING_BUFFER_BYTES
   }

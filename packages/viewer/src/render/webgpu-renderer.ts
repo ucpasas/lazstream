@@ -45,9 +45,11 @@ import {
   BYTES_PER_POINT,
   packChunk,
   packSeedsAsChunk,
-  voxelizePackedChunk,
+  voxelizePackedChunkTiered,
+  type VoxelTier,
   type SeedPoint,
 } from './point-packing'
+import type { Slot } from './ring-buffer'
 import type { RawPick } from './picking'
 export type { RawPick } from './picking'
 import { CLASS_LUT } from './colormaps'
@@ -69,12 +71,16 @@ const SEED_HIDE_THRESHOLD     = Infinity
 /** Frames a slot must be invisible before proactive eviction.
  *  At 60 fps, 5 frames ≈ 83 ms — survives fast pans without excessive churn. */
 const EVICT_GRACE_FRAMES      = 5      // keep seeds visible always — they provide the file-wide overview outline at every zoom level, useful when the ring buffer holds only a fraction of the file's chunks. Cost is trivial (one extra slot, ~7000 points per frame). Set to a finite number (e.g. 10) to hide seeds once N real chunks have landed.
-// Upper bound on simultaneous chunk uniforms (full slots + voxel slots share
-// the pool). The pick-ID encoding reserves 13 bits for the uniform index
-// (uniformIdx << 19), so 8192 is the encoding ceiling — going past it means
-// re-splitting the pick word. Melbourne fully sedimented (7073 voxel slots)
-// plus a large resident working set can exceed this; see the spike page.
-const MAX_SLOTS               = 8192
+// Upper bound on simultaneous chunk uniforms (full slots + voxel tier slots
+// share the pool). The pick-ID encoding reserves PICK_SLOT_BITS bits for the
+// uniform index; Stage 5 re-split the word 13/19 → 14/18 so a fully
+// sedimented Melbourne (7073 tier-0 slots + cached finer tiers) plus a large
+// resident working set fits. 18 point bits cap a slot at 262 143 points —
+// warn-guarded in addPackedData (standard LAZ chunks are 50 000; COPC max is
+// 65 535).
+const PICK_POINT_BITS         = 18
+const PICK_POINT_MASK         = (1 << PICK_POINT_BITS) - 1
+const MAX_SLOTS               = 16384   // = 2^(32 - PICK_POINT_BITS)
 const COMPUTE_WORKGROUP_SIZE  = 128
 const CLEAR_WORKGROUP_SIZE    = 256
 const MAX_DPR                 = 2.0           // clamp devicePixelRatio
@@ -82,22 +88,34 @@ const CAMERA_FOV              = 60
 const CAMERA_NEAR             = 0.1
 const CAMERA_FAR              = 100_000
 
-// --- Runtime voxel LOD (sediment layer) — Stage 5 spike ----------------------
-// See wiki [[Spike — Runtime Voxel LOD (Sediment Layer)]].
-/** Default voxel grid resolution per chunk AABB (?voxelGrid=N overrides). */
+// --- Runtime voxel LOD (sediment layer) — Stage 5, SHIPPED default ON --------
+// See wiki [[Spike — Runtime Voxel LOD (Sediment Layer)]]. Each decoded chunk
+// is voxelized at pack time into a PREFIX-ORDERED tier list (point-packing.ts):
+// tier 0 = (grid/4)³-equivalent, tier 1 completes (grid/2)³, tier 2 completes
+// grid³. The cull loop renders a distance-derived prefix of tiers, so one list
+// serves every zoom — the spike's grid/threshold-interlock fix. Only tier 0 is
+// permanent sediment (~15 KB/chunk at the default grid); tiers 1–2 are an
+// LRU cache evicted in preference to any tier 0.
+/** Default fine-grid resolution per chunk AABB (?voxelGrid=N overrides;
+ *  coerced to a multiple of 4 — tier structure needs grid/4 and grid/2). */
 const DEFAULT_VOXEL_GRID   = 64
 /** Voxel pool: carved off the TAIL of the ring GPU buffer (same buffer, same
  *  bindings — voxel slots address it via pointStrideOffset like any slot).
- *  Sized ringCapacity/8 capped at 128 MB. Voxel slots are NOT proactively
- *  evicted — they persist across full-slot eviction (the sediment). The pool
- *  self-evicts LRU only when full. */
-const VOXEL_POOL_MAX_BYTES = 128 * 1024 * 1024
-/** Render the voxel slot instead of the full slot when one projected voxel
+ *  Sized ringCapacity/8 capped at 256 MB (Melbourne-scale full tier-0
+ *  sediment is ~106 MB; the rest is fine-tier cache). Voxel slots are NOT
+ *  proactively evicted — they persist across full-slot eviction (the
+ *  sediment). The pool self-evicts LRU only when full, fine tiers first. */
+const VOXEL_POOL_MAX_BYTES = 256 * 1024 * 1024
+/** Render voxel tiers instead of the full slot when one projected FINE-grid
  *  cell covers fewer than ENTER px (voxels ≥1.25×denser than the pixel grid —
  *  gap-free by construction); switch back above EXIT px. The gap between the
- *  two is the flip-flicker hysteresis band. */
+ *  two is the flip-flicker hysteresis band. Within voxel mode the tier prefix
+ *  is chosen so the rendered cell size stays below ENTER px — tier switches
+ *  swap sub-pixel detail and need no hysteresis of their own. */
 const VOXEL_ENTER_PX = 0.8
 const VOXEL_EXIT_PX  = 1.0
+/** Composite key for the voxel pool + uniform maps: chunkIndex*3 + tier. */
+const VOXEL_TIERS = 3
 
 
 // Uniform buffer sizes (WGSL-aligned layouts — see shader files)
@@ -122,16 +140,19 @@ export interface WebGPURendererOptions {
    *  subgroup builtins demand uniform control flow, which the main shader's
    *  early returns violate. No-op if the device lacks 'subgroups'. */
   subgroupDedup?: boolean
-  /** Spike (?voxelLod=1): runtime voxel LOD "sediment layer". Each decoded
-   *  chunk is voxelized at pack time; over-covered chunks render their voxel
-   *  list instead of all ~50k points, and the voxel list persists across
-   *  eviction so evicted regions keep a recognisable silhouette. */
+  /** Runtime voxel LOD "sediment layer" — Stage 5, DEFAULT ON (pass false /
+   *  ?voxelLod=0 to opt out for A/B). Each decoded chunk is voxelized at pack
+   *  time into a prefix-ordered tier list; over-covered chunks render a
+   *  distance-derived tier prefix instead of all ~50k points, and the coarse
+   *  tier persists across eviction so evicted regions keep a recognisable
+   *  silhouette (ghosts) instead of collapsing to seed points. */
   voxelLod?: boolean
-  /** Voxel grid resolution (cells per chunk-AABB axis). Default 64. */
+  /** Fine voxel grid resolution (cells per chunk-AABB axis, multiple of 4).
+   *  Default 64; tiers render at grid/4, grid/2, grid. */
   voxelGrid?: number
-  /** Voxel pool size override in bytes (spike A/B: default min(128 MB, ring/8)). */
+  /** Voxel pool size override in bytes (default min(256 MB, ring/8)). */
   voxelPoolBytes?: number
-  /** Voxel switch-in threshold in projected px per cell (spike A/B: default 0.8;
+  /** Voxel switch-in threshold in projected px per fine cell (default 0.8;
    *  switch-out is 1.25× this). Larger = switch farther out, coarser look. */
   voxelSwitchPx?: number
 }
@@ -188,9 +209,10 @@ export class WebGPURenderer {
   /** Reverse map: uniform slot index → chunkIndex. Used to decode pick IDs (T2). */
   private readonly uniformIdxToChunkIndex = new Map<number, number>()
 
-  // Voxel sediment layer (Stage 5 spike — null when voxelLod is off).
+  // Voxel sediment layer (Stage 5 — null when voxelLod is opted out).
   // Offsets in voxelPool are relative to voxelPoolBase within the SAME ring
-  // GPU buffer; voxel slots draw uniform indices from the shared pool above.
+  // GPU buffer; voxel tier slots draw uniform indices from the shared pool
+  // above. Pool + uniform map are keyed by chunkIndex*VOXEL_TIERS + tier.
   private readonly voxelPool: RingBufferAllocator | null
   private readonly voxelPoolBase: number
   private readonly voxelGrid: number
@@ -342,12 +364,14 @@ export class WebGPURenderer {
     const ringCapacity = options.ringBufferCapacity ?? ctx.ringBufferCapacity
     // Voxel LOD: carve the sediment pool off the tail of the ring buffer so
     // both regions live in the one GPU buffer the shaders already bind.
-    this.voxelGrid = options.voxelGrid ?? DEFAULT_VOXEL_GRID
+    // Tier structure needs grid divisible by 4.
+    this.voxelGrid = Math.max(
+      8, Math.round((options.voxelGrid ?? DEFAULT_VOXEL_GRID) / 4) * 4)
     this.voxelEnterPx = options.voxelSwitchPx ?? VOXEL_ENTER_PX
     this.voxelExitPx  = options.voxelSwitchPx !== undefined
       ? options.voxelSwitchPx * 1.25
       : VOXEL_EXIT_PX
-    const voxelPoolBytes = options.voxelLod
+    const voxelPoolBytes = options.voxelLod !== false
       ? Math.floor((options.voxelPoolBytes ??
           Math.min(VOXEL_POOL_MAX_BYTES, ringCapacity / 8)) / 4) * 4
       : 0
@@ -355,7 +379,8 @@ export class WebGPURenderer {
     this.voxelPool = voxelPoolBytes > 0 ? new RingBufferAllocator(voxelPoolBytes) : null
     if (this.voxelPool) {
       console.log(
-        `[voxel] sediment layer ENABLED — grid ${this.voxelGrid}³, ` +
+        `[voxel] sediment layer ON — tiers ${this.voxelGrid / 4}/` +
+        `${this.voxelGrid / 2}/${this.voxelGrid}³, ` +
         `pool ${(voxelPoolBytes / 1024 / 1024).toFixed(0)} MB ` +
         `(ring buffer ${(this.voxelPoolBase / 1024 / 1024).toFixed(0)} MB)`
       )
@@ -705,11 +730,15 @@ export class WebGPURenderer {
     return this.deferredChunks.length
   }
 
-  /** Voxel sediment diagnostics (Stage 5 spike). Null when voxelLod is off. */
+  /** Voxel sediment diagnostics (Stage 5). Null when voxelLod is opted out. */
   getVoxelStats(): { chunks: number; bytesUsed: number; poolBytes: number; activeVoxelMode: number } | null {
     if (!this.voxelPool) return null
+    let tier0 = 0
+    for (const s of this.voxelPool.getSlots()) {
+      if (s.chunkIndex % VOXEL_TIERS === 0) tier0++
+    }
     return {
-      chunks: this.voxelPool.getSlots().length,
+      chunks: tier0,
       bytesUsed: this.voxelPool.bytesUsed(),
       poolBytes: this.voxelPool.capacity,
       activeVoxelMode: this.voxelModeActive.size,
@@ -1046,8 +1075,8 @@ export class WebGPURenderer {
       if (this.pickEnabled && idMapped) {
         const pickId = new Uint32Array(this.pickIdStaging.getMappedRange())[0]!
         if (pickId !== 0xFFFFFFFF) {
-          const uniformIdx = pickId >>> 19
-          localPointIndex  = pickId & 0x7FFFF
+          const uniformIdx = pickId >>> PICK_POINT_BITS
+          localPointIndex  = pickId & PICK_POINT_MASK
           chunkIndex       = this.uniformIdxToChunkIndex.get(uniformIdx) ?? -1
         }
       }
@@ -1217,6 +1246,15 @@ export class WebGPURenderer {
       console.warn(`[webgpu] no free uniform slot for chunk ${chunkIndex} — dropped`)
       return false
     }
+    if (pointCount > PICK_POINT_MASK + 1) {
+      // Points past 2^PICK_POINT_BITS still render, but their pick-IDs bleed
+      // into the slot bits — picking/color for them resolves wrongly. Only
+      // reachable with variable-chunk LAZ far beyond the 50k standard.
+      console.warn(
+        `[webgpu] chunk ${chunkIndex} has ${pointCount} points > ` +
+        `${PICK_POINT_MASK + 1} pick-ID capacity — attribute resolution may alias`
+      )
+    }
 
     const byteLength = pointCount * BYTES_PER_POINT
     const result = this.slots.allocate(
@@ -1293,13 +1331,17 @@ export class WebGPURenderer {
   }
 
   /**
-   * Voxelize + store a chunk's sediment voxel list (Stage 5 spike).
+   * Voxelize + store a chunk's prefix-ordered sediment tiers (Stage 5).
    *
    * Independent of full-slot allocation success — even a chunk that gets
-   * deferred or dropped leaves sediment. The voxel slot lives in the pool
-   * region of the ring buffer, holds its own uniform slot, and is never
-   * proactively evicted; the pool LRU-evicts internally only when full.
-   * Idempotent per chunkIndex (re-decode after eviction skips re-voxelizing).
+   * deferred or dropped leaves sediment. Each tier is its own pool slot +
+   * chunk uniform (self-contained hot/cold layout), so the render path can
+   * dispatch tiers 0..k as a distance-derived prefix with no shader changes.
+   * Voxel slots are never proactively evicted; the pool LRU-evicts internally
+   * only when full, spending fine-tier cache before permanent tier 0.
+   * Idempotent per chunkIndex (re-decode after eviction skips re-voxelizing;
+   * missing fine tiers of a sedimented chunk are NOT rebuilt — the coarse
+   * ghost covers the gap until the camera gets close enough for full points).
    */
   private addVoxelSediment(
     chunkIndex: number,
@@ -1309,58 +1351,105 @@ export class WebGPURenderer {
     range: [number, number, number],
   ): void {
     const pool = this.voxelPool
-    if (!pool || pool.getSlot(chunkIndex) !== undefined) return
+    if (!pool || pool.getSlot(chunkIndex * VOXEL_TIERS) !== undefined) return
 
     const t0 = performance.now()
-    const vox = voxelizePackedChunk(packed, pointCount, this.voxelGrid)
+    const vox = voxelizePackedChunkTiered(packed, pointCount, this.voxelGrid)
     this.timingVoxelizeTotal   += performance.now() - t0
-    this.timingVoxelCountTotal += vox.pointCount
-    if (vox.pointCount === 0) return
+    this.timingVoxelCountTotal += vox.totalVoxels
+    if (vox.totalVoxels === 0) return
 
-    const result = pool.allocate(
-      chunkIndex, vox.pointCount * BYTES_PER_POINT, vox.pointCount,
-      min, range, this.currentFrame,
-    )
-    if (!result) return   // single voxel list larger than the whole pool
-
-    // Pool-full LRU casualties: free their uniform slots + hysteresis state.
-    for (const evicted of result.evicted) {
-      const idx = this.voxelChunkToUniformIdx.get(evicted.chunkIndex)
-      if (idx !== undefined) {
-        this.freeUniformSlotIdxs.push(idx)
-        this.voxelChunkToUniformIdx.delete(evicted.chunkIndex)
-        this.uniformIdxToChunkIndex.delete(idx)
+    for (let tier = 0; tier < VOXEL_TIERS; tier++) {
+      const seg = vox.tiers[tier]
+      if (seg.pointCount === 0) continue
+      if (!this.allocateVoxelTier(chunkIndex, tier, seg, min, range)) {
+        // Resident tiers must stay a prefix — stop at the first failure.
+        return
       }
-      this.voxelModeActive.delete(evicted.chunkIndex)
     }
-    if (!result.slot) return   // every pool slot rendered this frame — skip
+  }
+
+  /** Allocate + upload one voxel tier slot. Returns false when it didn't fit. */
+  private allocateVoxelTier(
+    chunkIndex: number,
+    tier: number,
+    seg: VoxelTier,
+    min:   [number, number, number],
+    range: [number, number, number],
+  ): boolean {
+    const pool = this.voxelPool!
+    const key = chunkIndex * VOXEL_TIERS + tier
+    const byteLength = seg.pointCount * BYTES_PER_POINT
+    const fineTiersOnly = (k: number) => k % VOXEL_TIERS !== 0
+
+    // Fine tiers may only displace other fine tiers. Tier 0 tries that first,
+    // then — pool genuinely full of sediment — falls back to plain LRU
+    // (partial ghost coverage on files whose sediment outgrows the pool).
+    let result = pool.allocate(
+      key, byteLength, seg.pointCount, min, range, this.currentFrame, fineTiersOnly,
+    )
+    if (result && !result.slot && tier === 0) {
+      this.processVoxelEvictions(result.evicted)
+      result = pool.allocate(
+        key, byteLength, seg.pointCount, min, range, this.currentFrame,
+      )
+    }
+    if (!result) return false   // single tier larger than the whole pool
+    this.processVoxelEvictions(result.evicted)
+    if (!result.slot) return false   // every pool slot rendered this frame
 
     if (this.freeUniformSlotIdxs.length === 0) {
-      pool.remove(chunkIndex)
+      pool.remove(key)
       if (!this.voxelUniformExhaustedWarned) {
         this.voxelUniformExhaustedWarned = true
         console.warn(`[voxel] uniform slots exhausted (MAX_SLOTS=${MAX_SLOTS}) — new sediment dropped`)
       }
-      return
+      return false
     }
     const uniformIdx = this.freeUniformSlotIdxs.pop()!
-    this.voxelChunkToUniformIdx.set(chunkIndex, uniformIdx)
+    this.voxelChunkToUniformIdx.set(key, uniformIdx)
     // Picking a voxel resolves to the right chunk; localPointIndex is
-    // voxel-local (known spike limitation — T3 attrs would need a CPU-side
+    // tier-local (known limitation — T3 attrs would need a CPU-side
     // voxel→sourcePoint map).
     this.uniformIdxToChunkIndex.set(uniformIdx, chunkIndex)
 
     this.device.queue.writeBuffer(
       this.ringBuffer,
       this.voxelPoolBase + result.slot.byteOffset,
-      vox.packed.buffer,
-      vox.packed.byteOffset,
-      vox.packed.byteLength,
+      seg.packed.buffer,
+      seg.packed.byteOffset,
+      seg.packed.byteLength,
     )
     this.writeSlotUniform(
-      uniformIdx, vox.pointCount, min, range,
+      uniformIdx, seg.pointCount, min, range,
       (this.voxelPoolBase + result.slot.byteOffset) / 4,
     )
+    return true
+  }
+
+  /** Free uniform slots for pool-evicted tier keys, and cascade-remove finer
+   *  tiers of the same chunk so resident tiers always form a 0..k prefix
+   *  (rendering tier 2 without tier 1 would leave holes). */
+  private processVoxelEvictions(evicted: readonly Slot[]): void {
+    const pool = this.voxelPool!
+    for (const ev of evicted) {
+      this.dropVoxelTierUniform(ev.chunkIndex)
+      const tier = ev.chunkIndex % VOXEL_TIERS
+      const base = ev.chunkIndex - tier
+      for (let t = tier + 1; t < VOXEL_TIERS; t++) {
+        if (pool.remove(base + t)) this.dropVoxelTierUniform(base + t)
+      }
+      if (tier === 0) this.voxelModeActive.delete(base / VOXEL_TIERS)
+    }
+  }
+
+  private dropVoxelTierUniform(key: number): void {
+    const idx = this.voxelChunkToUniformIdx.get(key)
+    if (idx !== undefined) {
+      this.freeUniformSlotIdxs.push(idx)
+      this.voxelChunkToUniformIdx.delete(key)
+      this.uniformIdxToChunkIndex.delete(idx)
+    }
   }
 
   private releaseSlot(chunkIndex: number): void {
@@ -1647,11 +1736,12 @@ private evictInvisibleSlots(): void {
         // win applies when the camera actually leaves).
         this.slots.touch(slot.chunkIndex, this.currentFrame)
 
-        // Voxel LOD switch: render the sediment slot instead of the full
-        // slot when one projected voxel cell covers less than ~a pixel.
+        // Voxel LOD switch (Stage 5): render a distance-derived PREFIX of the
+        // chunk's voxel tiers instead of the full slot when one projected
+        // fine-grid cell covers less than ~a pixel.
         if (this.voxelPool && slot.chunkIndex !== SEED_PSEUDO_CHUNK_INDEX) {
-          const vslot = this.voxelPool.getSlot(slot.chunkIndex)
-          if (vslot !== undefined) {
+          const key0 = slot.chunkIndex * VOXEL_TIERS
+          if (this.voxelPool.getSlot(key0) !== undefined) {
             const dx = slot.min[0] - cx + slot.range[0] / 2 - camX
             const dy = slot.min[1] - cy + slot.range[1] / 2 - camY
             const dz = slot.min[2] - cz + slot.range[2] / 2 - camZ
@@ -1661,11 +1751,20 @@ private evictInvisibleSlots(): void {
             const wasVoxel = this.voxelModeActive.has(slot.chunkIndex)
             if (cellPix < (wasVoxel ? this.voxelExitPx : this.voxelEnterPx)) {
               this.voxelModeActive.add(slot.chunkIndex)
-              const vIdx = this.voxelChunkToUniformIdx.get(slot.chunkIndex)!
-              this.visibleSlotListScratch[visibleCount++] = vIdx
-              visiblePoints += vslot.pointCount
-              if (vslot.pointCount > maxPointCount) maxPointCount = vslot.pointCount
-              this.voxelPool.touch(slot.chunkIndex, this.currentFrame)
+              // Tier prefix: coarsest tier set whose rendered cells stay
+              // sub-threshold (tier-0 cells are 4× the fine cell, tier-1 2×).
+              // Tier switches swap sub-pixel detail — no hysteresis needed.
+              const prefixLen = cellPix * 4 < this.voxelEnterPx ? 1
+                              : cellPix * 2 < this.voxelEnterPx ? 2 : 3
+              for (let t = 0; t < prefixLen; t++) {
+                const vslot = this.voxelPool.getSlot(key0 + t)
+                if (vslot === undefined) continue   // empty or evicted-cascade tier
+                this.visibleSlotListScratch[visibleCount++] =
+                  this.voxelChunkToUniformIdx.get(key0 + t)!
+                visiblePoints += vslot.pointCount
+                if (vslot.pointCount > maxPointCount) maxPointCount = vslot.pointCount
+                this.voxelPool.touch(key0 + t, this.currentFrame)
+              }
               continue
             }
             if (wasVoxel) this.voxelModeActive.delete(slot.chunkIndex)
@@ -1677,14 +1776,16 @@ private evictInvisibleSlots(): void {
         if (slot.pointCount > maxPointCount) maxPointCount = slot.pointCount
       }
 
-      // Sediment ghosts: voxel slots whose chunk is NOT resident as a full
+      // Sediment ghosts: voxel tiers whose chunk is NOT resident as a full
       // slot (evicted, deferred-dropped, or never fitted). This is the layer
-      // that renders "even while outside the engine's decoded set".
+      // that renders "even while outside the engine's decoded set". Tier 0
+      // drives; the same distance rule picks how many cached finer tiers to
+      // add (a close ghost awaiting re-fetch renders every resident tier).
       if (this.voxelPool) {
         for (const vslot of this.voxelPool.getSlots()) {
-          if (this.slots.getSlot(vslot.chunkIndex) !== undefined) continue
-          const vIdx = this.voxelChunkToUniformIdx.get(vslot.chunkIndex)
-          if (vIdx === undefined) continue
+          if (vslot.chunkIndex % VOXEL_TIERS !== 0) continue
+          const key0 = vslot.chunkIndex
+          if (this.slots.getSlot(key0 / VOXEL_TIERS) !== undefined) continue
           this.cullSlotBox.min.set(
             vslot.min[0] - cx,
             vslot.min[1] - cy,
@@ -1696,10 +1797,23 @@ private evictInvisibleSlots(): void {
             vslot.min[2] - cz + vslot.range[2],
           )
           if (!this.cullFrustum.intersectsBox(this.cullSlotBox)) continue
-          this.visibleSlotListScratch[visibleCount++] = vIdx
-          visiblePoints += vslot.pointCount
-          if (vslot.pointCount > maxPointCount) maxPointCount = vslot.pointCount
-          this.voxelPool.touch(vslot.chunkIndex, this.currentFrame)
+          const dx = vslot.min[0] - cx + vslot.range[0] / 2 - camX
+          const dy = vslot.min[1] - cy + vslot.range[1] / 2 - camY
+          const dz = vslot.min[2] - cz + vslot.range[2] / 2 - camZ
+          const dist = Math.sqrt(dx * dx + dy * dy + dz * dz)
+          const cellWorld = Math.sqrt(vslot.range[0] * vslot.range[1]) / this.voxelGrid
+          const cellPix = dist > 0 ? (cellWorld * projScale) / dist : Infinity
+          const prefixLen = cellPix * 4 < this.voxelEnterPx ? 1
+                          : cellPix * 2 < this.voxelEnterPx ? 2 : 3
+          for (let t = 0; t < prefixLen; t++) {
+            const tslot = this.voxelPool.getSlot(key0 + t)
+            if (tslot === undefined) continue
+            this.visibleSlotListScratch[visibleCount++] =
+              this.voxelChunkToUniformIdx.get(key0 + t)!
+            visiblePoints += tslot.pointCount
+            if (tslot.pointCount > maxPointCount) maxPointCount = tslot.pointCount
+            this.voxelPool.touch(key0 + t, this.currentFrame)
+          }
         }
       }
 

@@ -48,7 +48,9 @@ struct ChunkUniform {
 @group(0) @binding(5) var<storage, read>       visibleSlots: array<u32>;
 // Pick-ID / visibility buffer. Always viewport-sized (Stage 2 promoted it to
 // the primary G-buffer — the resolve pass derives color from it per pixel).
-// Encoding: bits 31..19 = uniformIdx (slot in chunks[]), bits 18..0 = local point index.
+// Encoding: bits 31..18 = uniformIdx (slot in chunks[], 14 bits — Stage 5
+// re-split so MAX_SLOTS=16384 covers full-file sediment + resident set),
+// bits 17..0 = local point index (262143 max — warn-guarded host-side).
 // Sentinel 0xFFFFFFFF = no point (matches depth sentinel).
 @group(0) @binding(6) var<storage, read_write> pickBuffer:   array<u32>;
 
@@ -99,7 +101,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let depthBits = bitcast<u32>(ndc.z);
     // Encode (uniformIdx, pointIdx) — the resolve pass fetches color through this.
-    let encodedId = (uniformIdx << 19u) | pointIdx;
+    let encodedId = (uniformIdx << 18u) | pointIdx;
 
     // ?sgdedup=1 selects the points-depth-sgdedup.wgsl fork of this shader
     // (subgroup same-pixel dedup — needs uniform control flow, so it cannot

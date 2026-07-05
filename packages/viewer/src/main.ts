@@ -26,12 +26,16 @@
  *                      23%–3× depth-pass win, pixel-identical; opt-out for A/B)
  *   ?sgdedup=1         subgroup same-pixel dedup shader variant (spike; needs
  *                      the 'subgroups' WebGPU feature)
- *   ?voxelLod=1        runtime voxel LOD "sediment layer" (Stage 5 spike):
- *                      over-covered chunks render a persistent per-chunk voxel
- *                      list instead of all points; voxels survive eviction
- *   ?voxelGrid=N       voxel grid resolution per chunk axis (default 64)
- *   ?voxelPoolMB=N     voxel sediment pool size (default min(128, ring/8) MB)
- *   ?voxelPx=X         voxel switch-in threshold, projected px/cell (default 0.8)
+ *   ?voxelLod=0        disable the runtime voxel LOD "sediment layer" (ON by
+ *                      default — Stage 5: over-covered chunks render a
+ *                      distance-derived prefix of a coarse-to-fine voxel tier
+ *                      list instead of all points; the coarse tier survives
+ *                      eviction as a persistent ghost silhouette)
+ *   ?voxelGrid=N       fine voxel grid per chunk axis (default 64; tiers
+ *                      render at N/4, N/2, N)
+ *   ?voxelPoolMB=N     voxel sediment pool size (default min(256, ring/8) MB)
+ *   ?voxelPx=X         voxel switch-in threshold, projected px/fine-cell
+ *                      (default 0.8)
  *
  * URL fragment:
  *   #v=<base64url>     encoded ViewState (source + camera + colorMode) — takes priority
@@ -229,7 +233,7 @@ async function main(): Promise<void> {
       ringBufferCapacity,
       gpuTiming,
       subgroupDedup: urlParams.get('sgdedup') === '1',
-      voxelLod: urlParams.get('voxelLod') === '1',
+      voxelLod: urlParams.get('voxelLod') !== '0',
       voxelGrid,
       voxelPoolBytes,
       voxelSwitchPx,
