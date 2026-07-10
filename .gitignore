@@ -34,3 +34,4 @@ wiki/.obsidian/
 # Internal development artifacts — kept local only
 wiki/
 CLAUDE.md
+scripts/bench/
