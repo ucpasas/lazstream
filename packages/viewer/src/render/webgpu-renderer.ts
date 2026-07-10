@@ -15,9 +15,11 @@
  * engine.updateCamera() queries it.
  *
  * Pipeline per frame:
- *  1. clear-depth compute: reset depth buffer to 0xFFFFFFFF sentinel
- *  2. points-depth compute: one dispatch per slot, projects + atomicMin
- *  3. resolve-edl render: fullscreen triangle reads depth/color, applies EDL
+ *  1. clear-depth compute: reset depth + pick buffers to 0xFFFFFFFF sentinel
+ *  2. points-depth compute: 2D mega-dispatch, projects + atomicMin, writes
+ *     depth + pick-ID only (position-only 8 B/point hot loop — Stage 2)
+ *  3. resolve-edl render: fullscreen triangle reads depth + pick-ID, fetches
+ *     the winning point's color from the ring buffer (O(pixels)), applies EDL
  *
  * See plan + wiki ([[Renderer]], [[WebGPU Compute]], [[Ring Buffer GPU Memory]])
  * for the design rationale.
@@ -31,18 +33,23 @@ import * as THREE from 'three'
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js'
 
 import depthShaderSrc   from './shaders/points-depth.wgsl?raw'
+import depthShaderSgSrc from './shaders/points-depth-sgdedup.wgsl?raw'
 import clearShaderSrc   from './shaders/clear-depth.wgsl?raw'
 import resolveShaderSrc from './shaders/resolve-edl.wgsl?raw'
 
 import { createWebGPUContext, type WebGPUContext } from './webgpu-context'
 export { WebGPUUnsupportedError } from './webgpu-context'
+import { GpuPassTiming } from './gpu-pass-timing'
 import { RingBufferAllocator } from './ring-buffer'
 import {
   BYTES_PER_POINT,
   packChunk,
   packSeedsAsChunk,
+  voxelizePackedChunkTiered,
+  type VoxelTier,
   type SeedPoint,
 } from './point-packing'
+import type { Slot } from './ring-buffer'
 import type { RawPick } from './picking'
 export type { RawPick } from './picking'
 import { CLASS_LUT } from './colormaps'
@@ -59,21 +66,56 @@ const COLOR_PARAMS_BYTES = 32   // struct ColorParams: 8 × f32/u32
 
 // --- Constants ---------------------------------------------------------------
 
-/** Minimum valid GPUBuffer size; used as the pick buffer stub when picking is inactive. */
-const PICK_STUB_SIZE = 4
-
 const SEED_PSEUDO_CHUNK_INDEX = -1
 const SEED_HIDE_THRESHOLD     = Infinity
 /** Frames a slot must be invisible before proactive eviction.
  *  At 60 fps, 5 frames ≈ 83 ms — survives fast pans without excessive churn. */
 const EVICT_GRACE_FRAMES      = 5      // keep seeds visible always — they provide the file-wide overview outline at every zoom level, useful when the ring buffer holds only a fraction of the file's chunks. Cost is trivial (one extra slot, ~7000 points per frame). Set to a finite number (e.g. 10) to hide seeds once N real chunks have landed.
-const MAX_SLOTS               = 4096          // upper bound on simultaneous chunks
+// Upper bound on simultaneous chunk uniforms (full slots + voxel tier slots
+// share the pool). The pick-ID encoding reserves PICK_SLOT_BITS bits for the
+// uniform index; Stage 5 re-split the word 13/19 → 14/18 so a fully
+// sedimented Melbourne (7073 tier-0 slots + cached finer tiers) plus a large
+// resident working set fits. 18 point bits cap a slot at 262 143 points —
+// warn-guarded in addPackedData (standard LAZ chunks are 50 000; COPC max is
+// 65 535).
+const PICK_POINT_BITS         = 18
+const PICK_POINT_MASK         = (1 << PICK_POINT_BITS) - 1
+const MAX_SLOTS               = 16384   // = 2^(32 - PICK_POINT_BITS)
 const COMPUTE_WORKGROUP_SIZE  = 128
 const CLEAR_WORKGROUP_SIZE    = 256
 const MAX_DPR                 = 2.0           // clamp devicePixelRatio
 const CAMERA_FOV              = 60
 const CAMERA_NEAR             = 0.1
 const CAMERA_FAR              = 100_000
+
+// --- Runtime voxel LOD (sediment layer) — Stage 5, SHIPPED default ON --------
+// See wiki [[Spike — Runtime Voxel LOD (Sediment Layer)]]. Each decoded chunk
+// is voxelized at pack time into a PREFIX-ORDERED tier list (point-packing.ts):
+// tier 0 = (grid/4)³-equivalent, tier 1 completes (grid/2)³, tier 2 completes
+// grid³. The cull loop renders a distance-derived prefix of tiers, so one list
+// serves every zoom — the spike's grid/threshold-interlock fix. Only tier 0 is
+// permanent sediment (~15 KB/chunk at the default grid); tiers 1–2 are an
+// LRU cache evicted in preference to any tier 0.
+/** Default fine-grid resolution per chunk AABB (?voxelGrid=N overrides;
+ *  coerced to a multiple of 4 — tier structure needs grid/4 and grid/2). */
+const DEFAULT_VOXEL_GRID   = 64
+/** Voxel pool: carved off the TAIL of the ring GPU buffer (same buffer, same
+ *  bindings — voxel slots address it via pointStrideOffset like any slot).
+ *  Sized ringCapacity/8 capped at 256 MB (Melbourne-scale full tier-0
+ *  sediment is ~106 MB; the rest is fine-tier cache). Voxel slots are NOT
+ *  proactively evicted — they persist across full-slot eviction (the
+ *  sediment). The pool self-evicts LRU only when full, fine tiers first. */
+const VOXEL_POOL_MAX_BYTES = 256 * 1024 * 1024
+/** Render voxel tiers instead of the full slot when one projected FINE-grid
+ *  cell covers fewer than ENTER px (voxels ≥1.25×denser than the pixel grid —
+ *  gap-free by construction); switch back above EXIT px. The gap between the
+ *  two is the flip-flicker hysteresis band. Within voxel mode the tier prefix
+ *  is chosen so the rendered cell size stays below ENTER px — tier switches
+ *  swap sub-pixel detail and need no hysteresis of their own. */
+const VOXEL_ENTER_PX = 0.8
+const VOXEL_EXIT_PX  = 1.0
+/** Composite key for the voxel pool + uniform maps: chunkIndex*3 + tier. */
+const VOXEL_TIERS = 3
 
 
 // Uniform buffer sizes (WGSL-aligned layouts — see shader files)
@@ -89,6 +131,30 @@ export interface WebGPURendererOptions {
   edlStrength?: number   // default 200
   edlRadius?:   number   // default 1
   onFrame?:     (info: FrameInfo) => void
+  /** Dev-only (?gputiming=1): per-pass GPU timestamp instrumentation.
+   *  No-op (with a console warning) if the adapter lacks 'timestamp-query'. */
+  gpuTiming?:   boolean
+  /** Dev-only (?sgdedup=1): subgroup same-pixel dedup shader variant (spike).
+   *  When a whole subgroup's points land on one pixel, only the nearest
+   *  thread(s) issue the atomic. Uses the points-depth-sgdedup.wgsl fork —
+   *  subgroup builtins demand uniform control flow, which the main shader's
+   *  early returns violate. No-op if the device lacks 'subgroups'. */
+  subgroupDedup?: boolean
+  /** Runtime voxel LOD "sediment layer" — Stage 5, DEFAULT ON (pass false /
+   *  ?voxelLod=0 to opt out for A/B). Each decoded chunk is voxelized at pack
+   *  time into a prefix-ordered tier list; over-covered chunks render a
+   *  distance-derived tier prefix instead of all ~50k points, and the coarse
+   *  tier persists across eviction so evicted regions keep a recognisable
+   *  silhouette (ghosts) instead of collapsing to seed points. */
+  voxelLod?: boolean
+  /** Fine voxel grid resolution (cells per chunk-AABB axis, multiple of 4).
+   *  Default 64; tiers render at grid/4, grid/2, grid. */
+  voxelGrid?: number
+  /** Voxel pool size override in bytes (default min(256 MB, ring/8)). */
+  voxelPoolBytes?: number
+  /** Voxel switch-in threshold in projected px per fine cell (default 0.8;
+   *  switch-out is 1.25× this). Larger = switch farther out, coarser look. */
+  voxelSwitchPx?: number
 }
 
 export interface FrameInfo {
@@ -124,9 +190,9 @@ export class WebGPURenderer {
 
   // Buffers — viewport-dependent (recreated on resize)
   private depthBuffer!: GPUBuffer
-  private colorBuffer!: GPUBuffer
-  // Pick buffer: viewport-sized u32 array when picking is active; 4-byte stub otherwise.
-  // OOB writes from the depth shader to the stub are silently dropped by WebGPU.
+  // Pick-ID / visibility buffer — always viewport-sized (Stage 2: the resolve
+  // pass derives per-pixel color from it, so it is the primary G-buffer, not
+  // a picking-mode extra). Replaced the old colorBuffer at identical size.
   private pickBuffer!: GPUBuffer
   private viewportPixels = { w: 0, h: 0 }
 
@@ -142,6 +208,24 @@ export class WebGPURenderer {
   private readonly chunkToUniformIdx = new Map<number, number>()
   /** Reverse map: uniform slot index → chunkIndex. Used to decode pick IDs (T2). */
   private readonly uniformIdxToChunkIndex = new Map<number, number>()
+
+  // Voxel sediment layer (Stage 5 — null when voxelLod is opted out).
+  // Offsets in voxelPool are relative to voxelPoolBase within the SAME ring
+  // GPU buffer; voxel tier slots draw uniform indices from the shared pool
+  // above. Pool + uniform map are keyed by chunkIndex*VOXEL_TIERS + tier.
+  private readonly voxelPool: RingBufferAllocator | null
+  private readonly voxelPoolBase: number
+  private readonly voxelGrid: number
+  private readonly voxelEnterPx: number
+  private readonly voxelExitPx: number
+  private readonly voxelChunkToUniformIdx = new Map<number, number>()
+  /** Hysteresis: chunks currently rendering their voxel slot instead of the
+   *  full slot (avoids flip-flicker at the coverage threshold). */
+  private readonly voxelModeActive = new Set<number>()
+  // Voxel stats — reported alongside the pack-timing log.
+  private timingVoxelizeTotal = 0
+  private timingVoxelCountTotal = 0
+  private voxelUniformExhaustedWarned = false
 
   /**
    * Chunks that arrived from decode but couldn't fit in the ring buffer at the
@@ -163,6 +247,10 @@ export class WebGPURenderer {
    */
   private readonly MAX_DEFERRED_CHUNKS = 256
   private splatRadius = 2
+  // Default ON — measured 2026-07-04 (Melbourne/Ampere): 23% faster depth pass
+  // at close zoom, ~3× at full overview, pixel-identical output at both
+  // (screenshots in the roadmap results). ?adaptiveSplat=0 opts out for A/B.
+  private adaptiveSplat = true
   private deferredChunks: Array<{
     chunkIndex: number
     packed: Uint32Array
@@ -234,6 +322,9 @@ export class WebGPURenderer {
   private readonly edlStrength: number
   private readonly edlRadius: number
   private readonly onFrame?: (info: FrameInfo) => void
+  // Dev-only GPU pass timing (?gputiming=1). Null when disabled or unsupported —
+  // the render loop pays nothing in that case.
+  private readonly gpuTiming: GpuPassTiming | null
   private chunkEvictedCallback: ((chunkIndex: number) => void) | null = null
 
   // --- Picking (T1 + T2) ---------------------------------------------------
@@ -261,8 +352,40 @@ export class WebGPURenderer {
     this.edlRadius   = options.edlRadius   ?? 1
     this.onFrame     = options.onFrame
 
+    if (options.gpuTiming && ctx.hasTimestampQuery) {
+      this.gpuTiming = new GpuPassTiming(ctx.device)
+    } else {
+      if (options.gpuTiming) {
+        console.warn('[gputiming] adapter lacks timestamp-query — GPU pass timing disabled')
+      }
+      this.gpuTiming = null
+    }
+
     const ringCapacity = options.ringBufferCapacity ?? ctx.ringBufferCapacity
-    this.slots = new RingBufferAllocator(ringCapacity)  // v2: variable-size free-list
+    // Voxel LOD: carve the sediment pool off the tail of the ring buffer so
+    // both regions live in the one GPU buffer the shaders already bind.
+    // Tier structure needs grid divisible by 4.
+    this.voxelGrid = Math.max(
+      8, Math.round((options.voxelGrid ?? DEFAULT_VOXEL_GRID) / 4) * 4)
+    this.voxelEnterPx = options.voxelSwitchPx ?? VOXEL_ENTER_PX
+    this.voxelExitPx  = options.voxelSwitchPx !== undefined
+      ? options.voxelSwitchPx * 1.25
+      : VOXEL_EXIT_PX
+    const voxelPoolBytes = options.voxelLod !== false
+      ? Math.floor((options.voxelPoolBytes ??
+          Math.min(VOXEL_POOL_MAX_BYTES, ringCapacity / 8)) / 4) * 4
+      : 0
+    this.voxelPoolBase = ringCapacity - voxelPoolBytes
+    this.voxelPool = voxelPoolBytes > 0 ? new RingBufferAllocator(voxelPoolBytes) : null
+    if (this.voxelPool) {
+      console.log(
+        `[voxel] sediment layer ON — tiers ${this.voxelGrid / 4}/` +
+        `${this.voxelGrid / 2}/${this.voxelGrid}³, ` +
+        `pool ${(voxelPoolBytes / 1024 / 1024).toFixed(0)} MB ` +
+        `(ring buffer ${(this.voxelPoolBase / 1024 / 1024).toFixed(0)} MB)`
+      )
+    }
+    this.slots = new RingBufferAllocator(this.voxelPoolBase)  // v2: variable-size free-list
     this.freeUniformSlotIdxs = Array.from({ length: MAX_SLOTS }, (_, i) => MAX_SLOTS - 1 - i)
     // (Stored as a stack — pop() returns lowest idx first since we built it
     //  reversed. Order doesn't actually matter; we just need O(1) get/release.)
@@ -335,30 +458,42 @@ export class WebGPURenderer {
     this.depthBindLayout = this.device.createBindGroupLayout({
       label: 'lazstream/depth-bgl',
       entries: [
-        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
-        { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-        { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-        { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-        { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-        { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-        { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },        // pick buffer
-        { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },        // colorParams
-        { binding: 8, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // classLUT
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },           // camera
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // chunks
+        { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // points (ring)
+        { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },           // depth
+        { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // visible slots
+        { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },           // pick / visibility
       ],
     })
 
+    // Stage 2: the resolve pass owns color — it reads the pick-ID buffer and
+    // fetches/computes the winning point's color from the ring buffer.
     this.resolveBindLayout = this.device.createBindGroupLayout({
       label: 'lazstream/resolve-bgl',
       entries: [
-        { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
-        { binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
-        { binding: 2, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
+        { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },           // viewport
+        { binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } }, // depth
+        { binding: 2, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } }, // pick / visibility
+        { binding: 3, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } }, // points (ring)
+        { binding: 4, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } }, // chunks
+        { binding: 5, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },           // colorParams
+        { binding: 6, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } }, // classLUT
       ],
     })
 
     // --- Pipelines --------------------------------------------------------
+    let depthSrc = depthShaderSrc
+    if (options.subgroupDedup) {
+      if (ctx.hasSubgroups) {
+        depthSrc = depthShaderSgSrc
+        console.log('[sgdedup] subgroup same-pixel dedup ENABLED')
+      } else {
+        console.warn('[sgdedup] device lacks the subgroups feature — dedup disabled')
+      }
+    }
     const clearModule   = this.device.createShaderModule({ code: clearShaderSrc,   label: 'clear' })
-    const depthModule   = this.device.createShaderModule({ code: depthShaderSrc,   label: 'points-depth' })
+    const depthModule   = this.device.createShaderModule({ code: depthSrc,         label: 'points-depth' })
     const resolveModule = this.device.createShaderModule({ code: resolveShaderSrc, label: 'resolve-edl' })
 
     this.clearPipeline = this.device.createComputePipeline({
@@ -501,26 +636,38 @@ export class WebGPURenderer {
     const packed = packChunk(chunk)
     const packMs = performance.now() - packT0
 
-    this.timingDecodeTotal += chunk.decodeMs
-    this.timingPackTotal   += packMs
-    this.timingChunkCount++
-    if (this.timingChunkCount % this.TIMING_LOG_INTERVAL === 0) {
-      const n = this.TIMING_LOG_INTERVAL
-      console.debug(
-        `[lazstream/timing] last ${n} chunks — ` +
-        `decode avg ${(this.timingDecodeTotal / n).toFixed(1)} ms  ` +
-        `pack avg ${(this.timingPackTotal / n).toFixed(2)} ms`
-      )
-      this.timingDecodeTotal = 0
-      this.timingPackTotal   = 0
-    }
-
     const min: [number, number, number]   = [chunk.minX, chunk.minY, chunk.minZ]
     const range: [number, number, number] = [
       (chunk.maxX - chunk.minX) || 1,
       (chunk.maxY - chunk.minY) || 1,
       (chunk.maxZ - chunk.minZ) || 1,
     ]
+
+    // Sediment: voxelize BEFORE the full-slot attempt so even deferred /
+    // dropped chunks leave a ghost. No-op when voxelLod is off or the chunk
+    // already has sediment from a previous visit.
+    this.addVoxelSediment(chunk.chunkIndex, packed, chunk.pointCount, min, range)
+
+    this.timingDecodeTotal += chunk.decodeMs
+    this.timingPackTotal   += packMs
+    this.timingChunkCount++
+    if (this.timingChunkCount % this.TIMING_LOG_INTERVAL === 0) {
+      const n = this.TIMING_LOG_INTERVAL
+      const voxelInfo = this.voxelPool
+        ? `  voxelize avg ${(this.timingVoxelizeTotal / n).toFixed(2)} ms ` +
+          `(${Math.round(this.timingVoxelCountTotal / n)} voxels/chunk, ` +
+          `pool ${(this.voxelPool.bytesUsed() / 1024 / 1024).toFixed(1)} MB)`
+        : ''
+      console.debug(
+        `[lazstream/timing] last ${n} chunks — ` +
+        `decode avg ${(this.timingDecodeTotal / n).toFixed(1)} ms  ` +
+        `pack avg ${(this.timingPackTotal / n).toFixed(2)} ms` + voxelInfo
+      )
+      this.timingDecodeTotal = 0
+      this.timingPackTotal   = 0
+      this.timingVoxelizeTotal   = 0
+      this.timingVoxelCountTotal = 0
+    }
 
     if (this.addPackedData(chunk.chunkIndex, packed, chunk.pointCount, min, range)) {
       this.realChunkCount++
@@ -581,6 +728,21 @@ export class WebGPURenderer {
   /** Current deferred queue depth — for stats overlay diagnostics. */
   getDeferredCount(): number {
     return this.deferredChunks.length
+  }
+
+  /** Voxel sediment diagnostics (Stage 5). Null when voxelLod is opted out. */
+  getVoxelStats(): { chunks: number; bytesUsed: number; poolBytes: number; activeVoxelMode: number } | null {
+    if (!this.voxelPool) return null
+    let tier0 = 0
+    for (const s of this.voxelPool.getSlots()) {
+      if (s.chunkIndex % VOXEL_TIERS === 0) tier0++
+    }
+    return {
+      chunks: tier0,
+      bytesUsed: this.voxelPool.bytesUsed(),
+      poolBytes: this.voxelPool.capacity,
+      activeVoxelMode: this.voxelModeActive.size,
+    }
   }
 
   getCameraWorldPosition(): { x: number; y: number; z: number } {
@@ -665,6 +827,12 @@ export class WebGPURenderer {
     // Deferred-chunk queue → empty (any in-flight from previous load is moot)
     this.deferredChunks = []
     this.deferredOverflowCount = 0
+
+    // Voxel sediment → empty (previous file's ghosts are meaningless here)
+    this.voxelPool?.clear()
+    this.voxelChunkToUniformIdx.clear()
+    this.voxelModeActive.clear()
+    this.voxelUniformExhaustedWarned = false
 
     // Timing accumulators → reset for fresh load
     this.timingDecodeTotal = 0
@@ -756,6 +924,16 @@ export class WebGPURenderer {
     this.splatRadius = Math.max(1, Math.round(n))
   }
 
+  /** Adaptive splat: shrink the splat to 1×1 for points whose chunk is denser
+   *  than the pixel grid at its distance (hole-filling is only needed where
+   *  points are sparser than pixels). ~9× fewer scattered framebuffer accesses
+   *  in the over-coverage regime that dominates depth-pass cost. */
+  setAdaptiveSplat(enabled: boolean): void {
+    if (this.adaptiveSplat === enabled) return
+    this.adaptiveSplat = enabled
+    this.needsRender = true
+  }
+
   setColorMode(mode: ColorMode): ColorMode {
     const resolved: ColorMode = (mode === 'rgb' && !this.hasRGB) ? 'height' : mode
     if (this.colorMode === resolved) return resolved
@@ -793,32 +971,15 @@ export class WebGPURenderer {
   }
 
   /**
-   * Enable or disable the pick-ID G-buffer (T2).
+   * Enable or disable click-pick identity readback (T2).
    *
-   * When enabled, each frame the pick buffer is allocated at full viewport size
-   * (~33 MB at 4K) and cleared to sentinel alongside the depth buffer.
-   * The depth shader writes an encoded (uniformIdx | pointIndex) ID per pixel
-   * in the atomicMin win-branch. Canvas clicks trigger a depth + ID readback,
-   * and `onPointPicked` fires with the decoded world position and chunk identity.
-   *
-   * When disabled (default), the pick buffer is a 4-byte stub — the shader still
-   * writes to binding 6 but all writes are silently dropped as OOB by WebGPU.
-   * T1 (world position from depth) is always available on click regardless of
-   * this flag; only T2 (identity) requires it.
+   * Since Stage 2 the pick-ID buffer is always allocated and written — the
+   * resolve pass derives per-pixel color from it — so this flag only gates
+   * whether a canvas click also reads back the pick-ID word to decode chunk
+   * identity. T1 (world position from depth) is always available on click.
    */
   setPickingEnabled(enabled: boolean): void {
-    if (this.pickEnabled === enabled) return
     this.pickEnabled = enabled
-    this.pickBuffer.destroy()
-    const { w, h } = this.viewportPixels
-    const size = enabled ? Math.max(PICK_STUB_SIZE, w * h * 4) : PICK_STUB_SIZE
-    this.pickBuffer = this.device.createBuffer({
-      label: 'lazstream/pick',
-      size,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
-    })
-    this.rebuildBindGroups()
-    this.needsRender = true
   }
 
   /**
@@ -914,8 +1075,8 @@ export class WebGPURenderer {
       if (this.pickEnabled && idMapped) {
         const pickId = new Uint32Array(this.pickIdStaging.getMappedRange())[0]!
         if (pickId !== 0xFFFFFFFF) {
-          const uniformIdx = pickId >>> 19
-          localPointIndex  = pickId & 0x7FFFF
+          const uniformIdx = pickId >>> PICK_POINT_BITS
+          localPointIndex  = pickId & PICK_POINT_MASK
           chunkIndex       = this.uniformIdxToChunkIndex.get(uniformIdx) ?? -1
         }
       }
@@ -1054,7 +1215,6 @@ export class WebGPURenderer {
     // destroy() the larger buffers to release device memory eagerly.
     this.ringBuffer.destroy()
     this.depthBuffer.destroy()
-    this.colorBuffer.destroy()
     this.pickBuffer.destroy()
     this.pickDepthStaging.destroy()
     this.pickIdStaging.destroy()
@@ -1063,6 +1223,7 @@ export class WebGPURenderer {
     this.viewportUniform.destroy()
     this.colorParamsBuffer.destroy()
     this.classLutBuffer.destroy()
+    this.gpuTiming?.dispose()
     // Note: we don't `device.destroy()` because the canvas may outlive us
     // and another renderer instance might re-use the device.
   }
@@ -1084,6 +1245,15 @@ export class WebGPURenderer {
     if (this.freeUniformSlotIdxs.length === 0) {
       console.warn(`[webgpu] no free uniform slot for chunk ${chunkIndex} — dropped`)
       return false
+    }
+    if (pointCount > PICK_POINT_MASK + 1) {
+      // Points past 2^PICK_POINT_BITS still render, but their pick-IDs bleed
+      // into the slot bits — picking/color for them resolves wrongly. Only
+      // reachable with variable-chunk LAZ far beyond the 50k standard.
+      console.warn(
+        `[webgpu] chunk ${chunkIndex} has ${pointCount} points > ` +
+        `${PICK_POINT_MASK + 1} pick-ID capacity — attribute resolution may alias`
+      )
     }
 
     const byteLength = pointCount * BYTES_PER_POINT
@@ -1130,18 +1300,26 @@ export class WebGPURenderer {
       packedPoints.byteLength,
     )
 
-    // Write the chunk uniform. Stride is per-device alignment (256 typically).
+    this.writeSlotUniform(uniformIdx, pointCount, min, range, result.slot.byteOffset / 4)
+
+    return true
+  }
+
+  /** Write one ChunkUniform entry (shared by full slots and voxel slots). */
+  private writeSlotUniform(
+    uniformIdx: number,
+    pointCount: number,
+    min:   [number, number, number],
+    range: [number, number, number],
+    strideOffsetU32: number,
+  ): void {
     const u = this.chunkUniformScratch
     u[0] = min[0]; u[1] = min[1]; u[2] = min[2]
-    // word 3 (u32 reinterpret of float bits) — pointCount. Pack as int via DataView later.
-    // For brevity: write floats now, overwrite words 3 and 7 with u32 via a sibling DataView.
     u[4] = range[0]; u[5] = range[1]; u[6] = range[2]
-    // word 7 = pointStrideOffset (u32)
+    // words 3 and 7 are u32 (pointCount, pointStrideOffset) — write via DataView.
     const dv = new DataView(u.buffer, u.byteOffset, u.byteLength)
     dv.setUint32(12, pointCount, true)
-    dv.setUint32(28, result.slot.byteOffset / 4, true) // pointStrideOffset in u32s
-    // Zero the rest to be safe (alignment padding).
-    for (let i = 8; i < u.length; i++) u[i] = 0
+    dv.setUint32(28, strideOffsetU32, true)
 
     this.device.queue.writeBuffer(
       this.chunkUniform,
@@ -1150,8 +1328,128 @@ export class WebGPURenderer {
       u.byteOffset,
       CHUNK_UNIFORM_BYTES,
     )
+  }
 
+  /**
+   * Voxelize + store a chunk's prefix-ordered sediment tiers (Stage 5).
+   *
+   * Independent of full-slot allocation success — even a chunk that gets
+   * deferred or dropped leaves sediment. Each tier is its own pool slot +
+   * chunk uniform (self-contained hot/cold layout), so the render path can
+   * dispatch tiers 0..k as a distance-derived prefix with no shader changes.
+   * Voxel slots are never proactively evicted; the pool LRU-evicts internally
+   * only when full, spending fine-tier cache before permanent tier 0.
+   * Idempotent per chunkIndex (re-decode after eviction skips re-voxelizing;
+   * missing fine tiers of a sedimented chunk are NOT rebuilt — the coarse
+   * ghost covers the gap until the camera gets close enough for full points).
+   */
+  private addVoxelSediment(
+    chunkIndex: number,
+    packed: Uint32Array,
+    pointCount: number,
+    min:   [number, number, number],
+    range: [number, number, number],
+  ): void {
+    const pool = this.voxelPool
+    if (!pool || pool.getSlot(chunkIndex * VOXEL_TIERS) !== undefined) return
+
+    const t0 = performance.now()
+    const vox = voxelizePackedChunkTiered(packed, pointCount, this.voxelGrid)
+    this.timingVoxelizeTotal   += performance.now() - t0
+    this.timingVoxelCountTotal += vox.totalVoxels
+    if (vox.totalVoxels === 0) return
+
+    for (let tier = 0; tier < VOXEL_TIERS; tier++) {
+      const seg = vox.tiers[tier]
+      if (seg.pointCount === 0) continue
+      if (!this.allocateVoxelTier(chunkIndex, tier, seg, min, range)) {
+        // Resident tiers must stay a prefix — stop at the first failure.
+        return
+      }
+    }
+  }
+
+  /** Allocate + upload one voxel tier slot. Returns false when it didn't fit. */
+  private allocateVoxelTier(
+    chunkIndex: number,
+    tier: number,
+    seg: VoxelTier,
+    min:   [number, number, number],
+    range: [number, number, number],
+  ): boolean {
+    const pool = this.voxelPool!
+    const key = chunkIndex * VOXEL_TIERS + tier
+    const byteLength = seg.pointCount * BYTES_PER_POINT
+    const fineTiersOnly = (k: number) => k % VOXEL_TIERS !== 0
+
+    // Fine tiers may only displace other fine tiers. Tier 0 tries that first,
+    // then — pool genuinely full of sediment — falls back to plain LRU
+    // (partial ghost coverage on files whose sediment outgrows the pool).
+    let result = pool.allocate(
+      key, byteLength, seg.pointCount, min, range, this.currentFrame, fineTiersOnly,
+    )
+    if (result && !result.slot && tier === 0) {
+      this.processVoxelEvictions(result.evicted)
+      result = pool.allocate(
+        key, byteLength, seg.pointCount, min, range, this.currentFrame,
+      )
+    }
+    if (!result) return false   // single tier larger than the whole pool
+    this.processVoxelEvictions(result.evicted)
+    if (!result.slot) return false   // every pool slot rendered this frame
+
+    if (this.freeUniformSlotIdxs.length === 0) {
+      pool.remove(key)
+      if (!this.voxelUniformExhaustedWarned) {
+        this.voxelUniformExhaustedWarned = true
+        console.warn(`[voxel] uniform slots exhausted (MAX_SLOTS=${MAX_SLOTS}) — new sediment dropped`)
+      }
+      return false
+    }
+    const uniformIdx = this.freeUniformSlotIdxs.pop()!
+    this.voxelChunkToUniformIdx.set(key, uniformIdx)
+    // Picking a voxel resolves to the right chunk; localPointIndex is
+    // tier-local (known limitation — T3 attrs would need a CPU-side
+    // voxel→sourcePoint map).
+    this.uniformIdxToChunkIndex.set(uniformIdx, chunkIndex)
+
+    this.device.queue.writeBuffer(
+      this.ringBuffer,
+      this.voxelPoolBase + result.slot.byteOffset,
+      seg.packed.buffer,
+      seg.packed.byteOffset,
+      seg.packed.byteLength,
+    )
+    this.writeSlotUniform(
+      uniformIdx, seg.pointCount, min, range,
+      (this.voxelPoolBase + result.slot.byteOffset) / 4,
+    )
     return true
+  }
+
+  /** Free uniform slots for pool-evicted tier keys, and cascade-remove finer
+   *  tiers of the same chunk so resident tiers always form a 0..k prefix
+   *  (rendering tier 2 without tier 1 would leave holes). */
+  private processVoxelEvictions(evicted: readonly Slot[]): void {
+    const pool = this.voxelPool!
+    for (const ev of evicted) {
+      this.dropVoxelTierUniform(ev.chunkIndex)
+      const tier = ev.chunkIndex % VOXEL_TIERS
+      const base = ev.chunkIndex - tier
+      for (let t = tier + 1; t < VOXEL_TIERS; t++) {
+        if (pool.remove(base + t)) this.dropVoxelTierUniform(base + t)
+      }
+      if (tier === 0) this.voxelModeActive.delete(base / VOXEL_TIERS)
+    }
+  }
+
+  private dropVoxelTierUniform(key: number): void {
+    const idx = this.voxelChunkToUniformIdx.get(key)
+    if (idx !== undefined) {
+      this.freeUniformSlotIdxs.push(idx)
+      this.voxelChunkToUniformIdx.delete(key)
+      this.uniformIdxToChunkIndex.delete(idx)
+    }
   }
 
   private releaseSlot(chunkIndex: number): void {
@@ -1162,6 +1460,8 @@ export class WebGPURenderer {
       this.uniformIdxToChunkIndex.delete(uniformIdx)
     }
     this.slots.remove(chunkIndex)
+    // Full slot gone → the sediment ghost (if any) takes over next frame.
+    this.voxelModeActive.delete(chunkIndex)
   }
 
   /** Register a callback invoked when a chunk is proactively evicted because
@@ -1215,7 +1515,6 @@ private evictInvisibleSlots(): void {
 
     // Recreate viewport-sized buffers.
     if (this.depthBuffer) this.depthBuffer.destroy()
-    if (this.colorBuffer) this.colorBuffer.destroy()
 
     const pixelCount = w * h
     const sizeBytes  = pixelCount * 4
@@ -1226,17 +1525,12 @@ private evictInvisibleSlots(): void {
       size: sizeBytes,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
     })
-    this.colorBuffer = this.device.createBuffer({
-      label: 'lazstream/color',
-      size: sizeBytes,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-    })
 
-    // Recreate pick buffer at new viewport size (or keep stub if picking inactive)
+    // Pick-ID / visibility buffer — always full viewport size (Stage 2).
     if (this.pickBuffer) this.pickBuffer.destroy()
     this.pickBuffer = this.device.createBuffer({
       label: 'lazstream/pick',
-      size: this.pickEnabled ? sizeBytes : PICK_STUB_SIZE,
+      size: sizeBytes,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
     })
 
@@ -1263,11 +1557,8 @@ private evictInvisibleSlots(): void {
         { binding: 1, resource: { buffer: this.chunkUniform } },
         { binding: 2, resource: { buffer: this.ringBuffer } },
         { binding: 3, resource: { buffer: this.depthBuffer } },
-        { binding: 4, resource: { buffer: this.colorBuffer } },
         { binding: 5, resource: { buffer: this.visibleSlotListBuf } },
         { binding: 6, resource: { buffer: this.pickBuffer } },
-        { binding: 7, resource: { buffer: this.colorParamsBuffer } },
-        { binding: 8, resource: { buffer: this.classLutBuffer } },
       ],
     })
 
@@ -1277,7 +1568,11 @@ private evictInvisibleSlots(): void {
       entries: [
         { binding: 0, resource: { buffer: this.viewportUniform } },
         { binding: 1, resource: { buffer: this.depthBuffer } },
-        { binding: 2, resource: { buffer: this.colorBuffer } },
+        { binding: 2, resource: { buffer: this.pickBuffer } },
+        { binding: 3, resource: { buffer: this.ringBuffer } },
+        { binding: 4, resource: { buffer: this.chunkUniform } },
+        { binding: 5, resource: { buffer: this.colorParamsBuffer } },
+        { binding: 6, resource: { buffer: this.classLutBuffer } },
       ],
     })
   }
@@ -1314,8 +1609,10 @@ private evictInvisibleSlots(): void {
     // viewportSize: vec2<f32> at offset 64..71
     v[16] = this.viewportPixels.w
     v[17] = this.viewportPixels.h
-    // pad at 18, 19
-    v[18] = 0; v[19] = 0
+    // adaptiveSplat flag + world-to-pixel projection scale (see points-depth.wgsl)
+    v[18] = this.adaptiveSplat ? 1 : 0
+    // projectionMatrix[5] = cot(fovY/2); × h/2 converts (worldSize / distance) → pixels
+    v[19] = this.viewportPixels.h * 0.5 * this.camera.projectionMatrix.elements[5]
     // sceneCenter: vec3<f32> at offset 80..91
     v[20] = this.sceneCenter.x
     v[21] = this.sceneCenter.y
@@ -1330,7 +1627,6 @@ private evictInvisibleSlots(): void {
   private renderFrame = (): void => {
     if (this.disposed) return
     this.rafHandle = requestAnimationFrame(this.renderFrame)
-    this.currentFrame++
 
     // controls.update() drives damping animation; it fires the 'change' event
     // (which sets needsRender) for as long as damping is still settling.
@@ -1340,13 +1636,34 @@ private evictInvisibleSlots(): void {
     if (!this.needsRender && this.deferredChunks.length === 0) return
     this.needsRender = false
 
+    // currentFrame counts RENDERED frames only — it must not advance across
+    // idle-skipped frames. All LRU bookkeeping compares slot.lastRenderedFrame
+    // (written by the cull's touch()) against currentFrame; if idle frames
+    // incremented it, the first chunk to arrive after an idle period would see
+    // every slot — including currently-on-screen ones and the seed
+    // pseudo-chunk — as LRU-evictable, and defrag-by-eviction would evict
+    // visible data (observed: seed layer silently destroyed on small buffers).
+    this.currentFrame++
+
     this.writeCameraUniform()
+
+    // GPU pass timing (?gputiming=1): claim a staging buffer for this frame.
+    // False when disabled OR when the whole readback pool is in flight — in
+    // either case the frame renders uninstrumented, never stalled.
+    const timed = this.gpuTiming !== null && this.gpuTiming.tryBeginFrame()
 
     const encoder = this.device.createCommandEncoder({ label: `lazstream/frame-${this.currentFrame}` })
 
+    // Visible-slot stats from the cull below — reported alongside pass timings.
+    let visibleCount  = 0
+    let visiblePoints = 0
+
     // --- Clear depth buffer to 0xFFFFFFFF ---
     {
-      const pass = encoder.beginComputePass({ label: 'clear-depth' })
+      const pass = encoder.beginComputePass({
+        label: 'clear-depth',
+        ...(timed ? { timestampWrites: this.gpuTiming!.timestampWrites(0) } : {}),
+      })
       pass.setPipeline(this.clearPipeline)
       pass.setBindGroup(0, this.clearBindGroup)
       const pixelCount = this.viewportPixels.w * this.viewportPixels.h
@@ -1356,7 +1673,10 @@ private evictInvisibleSlots(): void {
 
     // --- Compute pass: project + atomicMin per slot ---
     {
-      const pass = encoder.beginComputePass({ label: 'points-depth' })
+      const pass = encoder.beginComputePass({
+        label: 'points-depth',
+        ...(timed ? { timestampWrites: this.gpuTiming!.timestampWrites(1) } : {}),
+      })
       pass.setPipeline(this.depthPipeline)
 
       // CPU-side frustum cull (6-plane vs AABB). Skip dispatch AND touch
@@ -1384,8 +1704,13 @@ private evictInvisibleSlots(): void {
 
       // Build visible slot list on CPU (same AABB cull as before), then
       // issue a single 2D dispatch instead of N setBindGroup+dispatch calls.
-      let visibleCount = 0
       let maxPointCount = 0
+      // projScale (world→pixel at distance d: size·projScale/d) — already
+      // computed into the camera uniform this frame by writeCameraUniform().
+      const projScale = this.cameraUniformView[19]
+      const camX = this.camera.position.x
+      const camY = this.camera.position.y
+      const camZ = this.camera.position.z
 
       for (const slot of this.slots.getSlots()) {
         if (slot.pointCount === 0) continue
@@ -1405,10 +1730,91 @@ private evictInvisibleSlots(): void {
 
         const uniformIdx = this.chunkToUniformIdx.get(slot.chunkIndex)
         if (uniformIdx === undefined) continue // shouldn't happen
-        this.visibleSlotListScratch[visibleCount++] = uniformIdx
-        if (slot.pointCount > maxPointCount) maxPointCount = slot.pointCount
-        // Touch for LRU bookkeeping — this slot was rendered this frame.
+        // Touch for LRU bookkeeping — the chunk is on screen this frame, even
+        // if the voxel path renders in its place below (keeping residency
+        // avoids evict→refetch churn for over-covered chunks; the sediment
+        // win applies when the camera actually leaves).
         this.slots.touch(slot.chunkIndex, this.currentFrame)
+
+        // Voxel LOD switch (Stage 5): render a distance-derived PREFIX of the
+        // chunk's voxel tiers instead of the full slot when one projected
+        // fine-grid cell covers less than ~a pixel.
+        if (this.voxelPool && slot.chunkIndex !== SEED_PSEUDO_CHUNK_INDEX) {
+          const key0 = slot.chunkIndex * VOXEL_TIERS
+          if (this.voxelPool.getSlot(key0) !== undefined) {
+            const dx = slot.min[0] - cx + slot.range[0] / 2 - camX
+            const dy = slot.min[1] - cy + slot.range[1] / 2 - camY
+            const dz = slot.min[2] - cz + slot.range[2] / 2 - camZ
+            const dist = Math.sqrt(dx * dx + dy * dy + dz * dz)
+            const cellWorld = Math.sqrt(slot.range[0] * slot.range[1]) / this.voxelGrid
+            const cellPix = dist > 0 ? (cellWorld * projScale) / dist : Infinity
+            const wasVoxel = this.voxelModeActive.has(slot.chunkIndex)
+            if (cellPix < (wasVoxel ? this.voxelExitPx : this.voxelEnterPx)) {
+              this.voxelModeActive.add(slot.chunkIndex)
+              // Tier prefix: coarsest tier set whose rendered cells stay
+              // sub-threshold (tier-0 cells are 4× the fine cell, tier-1 2×).
+              // Tier switches swap sub-pixel detail — no hysteresis needed.
+              const prefixLen = cellPix * 4 < this.voxelEnterPx ? 1
+                              : cellPix * 2 < this.voxelEnterPx ? 2 : 3
+              for (let t = 0; t < prefixLen; t++) {
+                const vslot = this.voxelPool.getSlot(key0 + t)
+                if (vslot === undefined) continue   // empty or evicted-cascade tier
+                this.visibleSlotListScratch[visibleCount++] =
+                  this.voxelChunkToUniformIdx.get(key0 + t)!
+                visiblePoints += vslot.pointCount
+                if (vslot.pointCount > maxPointCount) maxPointCount = vslot.pointCount
+                this.voxelPool.touch(key0 + t, this.currentFrame)
+              }
+              continue
+            }
+            if (wasVoxel) this.voxelModeActive.delete(slot.chunkIndex)
+          }
+        }
+
+        this.visibleSlotListScratch[visibleCount++] = uniformIdx
+        visiblePoints += slot.pointCount
+        if (slot.pointCount > maxPointCount) maxPointCount = slot.pointCount
+      }
+
+      // Sediment ghosts: voxel tiers whose chunk is NOT resident as a full
+      // slot (evicted, deferred-dropped, or never fitted). This is the layer
+      // that renders "even while outside the engine's decoded set". Tier 0
+      // drives; the same distance rule picks how many cached finer tiers to
+      // add (a close ghost awaiting re-fetch renders every resident tier).
+      if (this.voxelPool) {
+        for (const vslot of this.voxelPool.getSlots()) {
+          if (vslot.chunkIndex % VOXEL_TIERS !== 0) continue
+          const key0 = vslot.chunkIndex
+          if (this.slots.getSlot(key0 / VOXEL_TIERS) !== undefined) continue
+          this.cullSlotBox.min.set(
+            vslot.min[0] - cx,
+            vslot.min[1] - cy,
+            vslot.min[2] - cz,
+          )
+          this.cullSlotBox.max.set(
+            vslot.min[0] - cx + vslot.range[0],
+            vslot.min[1] - cy + vslot.range[1],
+            vslot.min[2] - cz + vslot.range[2],
+          )
+          if (!this.cullFrustum.intersectsBox(this.cullSlotBox)) continue
+          const dx = vslot.min[0] - cx + vslot.range[0] / 2 - camX
+          const dy = vslot.min[1] - cy + vslot.range[1] / 2 - camY
+          const dz = vslot.min[2] - cz + vslot.range[2] / 2 - camZ
+          const dist = Math.sqrt(dx * dx + dy * dy + dz * dz)
+          const cellWorld = Math.sqrt(vslot.range[0] * vslot.range[1]) / this.voxelGrid
+          const cellPix = dist > 0 ? (cellWorld * projScale) / dist : Infinity
+          const prefixLen = cellPix * 4 < this.voxelEnterPx ? 1
+                          : cellPix * 2 < this.voxelEnterPx ? 2 : 3
+          for (let t = 0; t < prefixLen; t++) {
+            const tslot = this.voxelPool.getSlot(key0 + t)
+            if (tslot === undefined) continue
+            this.visibleSlotListScratch[visibleCount++] =
+              this.voxelChunkToUniformIdx.get(key0 + t)!
+            visiblePoints += tslot.pointCount
+            if (tslot.pointCount > maxPointCount) maxPointCount = tslot.pointCount
+            this.voxelPool.touch(key0 + t, this.currentFrame)
+          }
+        }
       }
 
       if (visibleCount > 0) {
@@ -1447,6 +1853,7 @@ private evictInvisibleSlots(): void {
           storeOp: 'store',
           clearValue: { r: 0.04, g: 0.04, b: 0.06, a: 1.0 },
         }],
+        ...(timed ? { timestampWrites: this.gpuTiming!.timestampWrites(2) } : {}),
       })
       pass.setPipeline(this.resolvePipeline)
       pass.setBindGroup(0, this.resolveBindGroup)
@@ -1454,7 +1861,11 @@ private evictInvisibleSlots(): void {
       pass.end()
     }
 
+    if (timed) this.gpuTiming!.encodeResolve(encoder, visibleCount, visiblePoints)
+
     this.device.queue.submit([encoder.finish()])
+
+    if (timed) this.gpuTiming!.readbackAfterSubmit()
 
     if (this.onFrame) {
       this.onFrame({

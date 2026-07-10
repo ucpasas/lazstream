@@ -285,18 +285,36 @@ export async function fetchSeedPoints(
     const batchEnd = Math.min(batchStart + BATCH_SIZE, chunks.length)
     const batchChunks = chunks.slice(batchStart, batchEnd)
 
+    // One flaky range request out of thousands must not reject the whole
+    // Promise.all and fail the tile (measured ~1 in 4 bench runs on a 7073-
+    // chunk file). Retry each seed once; a seed that fails twice is skipped —
+    // a single missing seed is harmless (same effect as the bounds check).
     const batchBuffers = await Promise.all(
-      batchChunks.map(chunk => {
+      batchChunks.map(async (chunk, i): Promise<ArrayBuffer | null> => {
         const seedStart = chunk.offset + seedByteOffset
         const seedEnd = seedStart + seedByteLength - 1
-        return fetchRange(url, seedStart, seedEnd, signal)
+        try {
+          return await fetchRange(url, seedStart, seedEnd, signal)
+        } catch (err) {
+          if (signal?.aborted) throw err
+          try {
+            return await fetchRange(url, seedStart, seedEnd, signal)
+          } catch (retryErr) {
+            console.warn(
+              `[lazstream] seed fetch for chunk ${batchStart + i} failed twice — skipping`,
+              retryErr,
+            )
+            return null
+          }
+        }
       })
     )
 
     for (let i = 0; i < batchBuffers.length; i++) {
       const buf = batchBuffers[i]
-      const view = new DataView(buf)
       const chunkIndex = batchStart + i
+      if (buf === null) continue
+      const view = new DataView(buf)
 
       if (buf.byteLength < 12) {
         console.warn(

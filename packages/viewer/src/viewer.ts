@@ -53,6 +53,14 @@ export interface ViewerOptions {
   /** Point splat radius in pixels. Default: 2 (3 × 3 px). */
   splatRadius?: number
   /**
+   * Runtime voxel LOD "sediment layer". Default: true. Over-covered chunks
+   * render a distance-derived prefix of a coarse-to-fine voxel tier list
+   * instead of every point, and the coarse tier persists across GPU eviction
+   * so previously visited regions keep a recognisable ghost silhouette.
+   * Pass false to disable (e.g. for benchmarking the raw path).
+   */
+  voxelLod?: boolean
+  /**
    * Asset URL overrides for laz-perf worker assets.
    * Passed through to ManifestSession → WorkerPool.
    * Defaults: WorkerPool resolves assets relative to its own module via import.meta.url,
@@ -109,6 +117,7 @@ export class LazstreamViewer {
   static async create(canvas: HTMLCanvasElement, options: ViewerOptions = {}): Promise<LazstreamViewer> {
     const renderer = await WebGPURenderer.create(canvas, {
       ringBufferCapacity: options.ringBufferCapacity,
+      voxelLod: options.voxelLod,
     })
     if (options.splatRadius !== undefined) renderer.setSplatRadius(options.splatRadius)
     return new LazstreamViewer(renderer, options)

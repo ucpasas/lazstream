@@ -6,12 +6,9 @@
 // for floats in [0,1] is at most 0x3F800000). 0xFFFFFFFF works perfectly as
 // the initial atomicMin value.
 //
-// The color buffer doesn't need this — it can stay garbage between frames
-// because the resolve pass only reads pixels whose depth != 0xFFFFFFFF.
-//
-// The pick buffer (binding 1) is reset to the same sentinel each frame.
-// When picking is inactive the pick buffer is a 4-byte stub; arrayLength()
-// returns 1 so only element 0 is touched — no out-of-bounds writes.
+// The pick-ID / visibility buffer (binding 1) is reset to the same sentinel
+// each frame. Since Stage 2 it is always viewport-sized — the resolve pass
+// reads it per pixel to fetch the winning point's color.
 
 @group(0) @binding(0) var<storage, read_write> depthBuffer: array<atomic<u32>>;
 @group(0) @binding(1) var<storage, read_write> pickBuffer:  array<u32>;

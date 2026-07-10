@@ -7,10 +7,18 @@
  *   classification: Uint8Array, length = pointCount       (ASPRS class byte)
  *   intensity8:     Uint8Array, length = pointCount       (seed-range-stretched intensity)
  *
- * GPU layout (12 bytes per point, 3 × u32):
- *   word 0:  x in low 16 bits | y in high 16 bits
- *   word 1:  z in low 16 bits | intensity8 in bits 16–23 | classification in bits 24–31
- *   word 2:  RGBA8 little-endian: R | (G<<8) | (B<<16) | (A<<24)
+ * GPU layout (12 bytes per point, 3 × u32, split hot/cold within the slot):
+ *
+ *   Position region (hot — the only region the depth pass reads, 8 B/point):
+ *     word 0:  x in low 16 bits | y in high 16 bits
+ *     word 1:  z in low 16 bits | intensity8 in bits 16–23 | classification in bits 24–31
+ *   Attribute region (cold — read per-pixel by the resolve pass, 4 B/point,
+ *   starts at u32 offset 2×pointCount within the slot):
+ *     word:    RGBA8 little-endian: R | (G<<8) | (B<<16) | (A<<24)
+ *
+ * Stage 2 of the Renderer Performance Roadmap: splitting position from
+ * attributes keeps the depth pass's DRAM traffic to 8 B/point (contiguous),
+ * and color resolution becomes O(pixels) via the pick-ID visibility buffer.
  *
  * The compute shader reinterprets the int16 halves to signed via bit-twiddling
  * (see points-depth.wgsl unpackI16).
@@ -38,6 +46,7 @@ export interface SeedPoint {
 export function packChunk(chunk: DecodedChunk): Uint32Array {
   const { positions, colors, classification, intensity8, pointCount } = chunk
   const packed = new Uint32Array(pointCount * 3)
+  const attrBase = pointCount * 2   // cold region starts after all positions
 
   for (let i = 0; i < pointCount; i++) {
     // `& 0xFFFF` masks the int16 bit pattern into the low 16 bits of a u32.
@@ -54,13 +63,141 @@ export function packChunk(chunk: DecodedChunk): Uint32Array {
     const b = colors[i * 4 + 2]
     const a = colors[i * 4 + 3]
 
-    packed[i * 3 + 0] = (yi << 16) | xi
+    packed[i * 2 + 0] = (yi << 16) | xi
     // word 1: z in low 16 bits, intensity8 in bits 16–23, classification in bits 24–31
-    packed[i * 3 + 1] = ((cls << 24) | (i8 << 16) | zi) >>> 0
-    packed[i * 3 + 2] = ((a << 24) | (b << 16) | (g << 8) | r) >>> 0
+    packed[i * 2 + 1] = ((cls << 24) | (i8 << 16) | zi) >>> 0
+    packed[attrBase + i] = ((a << 24) | (b << 16) | (g << 8) | r) >>> 0
   }
 
   return packed
+}
+
+// ─── Runtime voxel LOD (sediment layer) — Stage 5 ──────────────────────────
+// See wiki [[Spike — Runtime Voxel LOD (Sediment Layer)]]. Derives a coarse
+// per-chunk voxel list from the already-packed point data: quantise each point
+// to a grid³ lattice over the chunk AABB, keep the first point that lands in
+// each occupied cell as its representative. Output rides the exact same packed
+// 12 B hot/cold layout, so voxel slots render through the unchanged shaders —
+// a voxel IS a point (full 16-bit position precision, representative's color).
+//
+// Ship shape (the spike's grid/threshold-interlock finding): a single fixed
+// grid cannot serve both the substitution role (needs ~1 px cells → fine grid,
+// huge) and the sediment role (needs ≤30 KB/chunk → coarse grid). So the
+// occupied cells are emitted PREFIX-ORDERED, coarse-to-fine, as three
+// self-contained tier segments:
+//   tier 0 — one voxel per occupied (grid/4)³ cell   (16³ at the default 64)
+//   tier 1 — completes one voxel per (grid/2)³ cell  (32³)
+//   tier 2 — completes the full grid³ set            (64³)
+// Rendering tiers 0..k is exactly a coarser-grid voxelisation, so a
+// distance-derived prefix serves every zoom from one list. Only tier 0 is
+// permanent sediment; finer tiers are an evictable cache (renderer policy).
+
+/** Scratch lattices — lazily (re)grown, reused across calls. Entries hold
+ *  (pointIndex+1) / a seen flag during a call and are zeroed through the
+ *  occupied lists afterwards, so per-call reset is O(voxels), not O(grid³). */
+let voxelScratch: Uint32Array | null = null
+let voxelScratchGrid = 0
+let parentScratch4: Uint8Array | null = null   // (grid/4)³ seen flags
+let parentScratch2: Uint8Array | null = null   // (grid/2)³ seen flags
+
+export interface VoxelTier {
+  packed: Uint32Array
+  pointCount: number
+}
+
+export interface TieredVoxelChunk {
+  /** [coarse (grid/4), refine-to-grid/2, refine-to-grid]. Tiers may be empty. */
+  tiers: [VoxelTier, VoxelTier, VoxelTier]
+  totalVoxels: number
+}
+
+/**
+ * Voxelize an already-packed chunk into a prefix-ordered tier list. `packed`
+ * is the packChunk() output (hot region 2 u32/pt, then cold region 1 u32/pt);
+ * positions are int16 bit patterns, so cell indices come from integer ops
+ * only — no dequantization. `grid` must be a multiple of 4 (caller coerces).
+ */
+export function voxelizePackedChunkTiered(
+  packed: Uint32Array,
+  pointCount: number,
+  grid: number,
+): TieredVoxelChunk {
+  if (voxelScratch === null || voxelScratchGrid !== grid) {
+    voxelScratch = new Uint32Array(grid * grid * grid)
+    const g4 = grid >> 2
+    const g2 = grid >> 1
+    parentScratch4 = new Uint8Array(g4 * g4 * g4)
+    parentScratch2 = new Uint8Array(g2 * g2 * g2)
+    voxelScratchGrid = grid
+  }
+  const scratch = voxelScratch
+  const seen4 = parentScratch4!
+  const seen2 = parentScratch2!
+  const g4 = grid >> 2
+  const g2 = grid >> 1
+
+  // Pass 1 — occupied fine cells, first-hit representative, per tier.
+  // A point's tier is decided at insertion time: unseen (grid/4)-parent → tier
+  // 0 (and it also covers its (grid/2)-parent so tiers 0..1 stay a complete
+  // (grid/2)³ voxelisation); else unseen (grid/2)-parent → tier 1; else tier 2.
+  const occupied: [number[], number[], number[]] = [[], [], []]
+  const marked4: number[] = []
+  const marked2: number[] = []
+
+  for (let i = 0; i < pointCount; i++) {
+    const w0 = packed[i * 2 + 0]
+    const w1 = packed[i * 2 + 1]
+    // int16 bit pattern → unsigned [0,65535] (the shader's +32768 shift, as XOR).
+    const ux = (w0 & 0xFFFF) ^ 0x8000
+    const uy = ((w0 >>> 16) & 0xFFFF) ^ 0x8000
+    const uz = (w1 & 0xFFFF) ^ 0x8000
+    const cx = (ux * grid) >>> 16
+    const cy = (uy * grid) >>> 16
+    const cz = (uz * grid) >>> 16
+    const cell = (cx * grid + cy) * grid + cz
+    if (scratch[cell] !== 0) continue
+    scratch[cell] = i + 1
+
+    const p4 = ((cx >> 2) * g4 + (cy >> 2)) * g4 + (cz >> 2)
+    const p2 = ((cx >> 1) * g2 + (cy >> 1)) * g2 + (cz >> 1)
+    if (seen4[p4] === 0) {
+      seen4[p4] = 1
+      marked4.push(p4)
+      if (seen2[p2] === 0) { seen2[p2] = 1; marked2.push(p2) }
+      occupied[0].push(cell)
+    } else if (seen2[p2] === 0) {
+      seen2[p2] = 1
+      marked2.push(p2)
+      occupied[1].push(cell)
+    } else {
+      occupied[2].push(cell)
+    }
+  }
+
+  // Pass 2 — pack each tier as its own self-contained hot/cold slot.
+  const srcAttrBase = pointCount * 2
+  const tiers = occupied.map((cells) => {
+    const n = cells.length
+    const out = new Uint32Array(n * 3)
+    const dstAttrBase = n * 2
+    for (let k = 0; k < n; k++) {
+      const i = scratch[cells[k]] - 1
+      out[k * 2 + 0]       = packed[i * 2 + 0]
+      out[k * 2 + 1]       = packed[i * 2 + 1]
+      out[dstAttrBase + k] = packed[srcAttrBase + i]
+    }
+    return { packed: out, pointCount: n }
+  }) as [VoxelTier, VoxelTier, VoxelTier]
+
+  // Reset scratches through the occupied lists.
+  for (const cells of occupied) for (const c of cells) scratch[c] = 0
+  for (const p of marked4) seen4[p] = 0
+  for (const p of marked2) seen2[p] = 0
+
+  return {
+    tiers,
+    totalVoxels: occupied[0].length + occupied[1].length + occupied[2].length,
+  }
 }
 
 export interface PackedSeeds {
@@ -100,6 +237,7 @@ export function packSeedsAsChunk(seeds: SeedPoint[]): PackedSeeds {
   const rangeZ = maxZ - minZ || 1
 
   const packed = new Uint32Array(seeds.length * 3)
+  const attrBase = seeds.length * 2
   for (let i = 0; i < seeds.length; i++) {
     const s = seeds[i]
     const qx = Math.round(((s.x - minX) / rangeX) * 65535 - 32768) & 0xFFFF
@@ -111,9 +249,9 @@ export function packSeedsAsChunk(seeds: SeedPoint[]): PackedSeeds {
     const g = Math.max(0, Math.min(255, Math.round(60  + (1 - Math.abs(t - 0.5) * 2) * 120)))
     const b = Math.max(0, Math.min(255, Math.round(220 - t * 200)))
 
-    packed[i * 3 + 0] = (qy << 16) | qx
-    packed[i * 3 + 1] = qz
-    packed[i * 3 + 2] = ((0xFF << 24) | (b << 16) | (g << 8) | r) >>> 0
+    packed[i * 2 + 0] = (qy << 16) | qx
+    packed[i * 2 + 1] = qz
+    packed[attrBase + i] = ((0xFF << 24) | (b << 16) | (g << 8) | r) >>> 0
   }
 
   return {

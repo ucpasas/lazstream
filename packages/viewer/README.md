@@ -58,6 +58,7 @@ Pass options to `LazstreamViewer.create(canvas, options)`.
 | `maxFetches` | `workerCount × 4` | Max concurrent HTTP range requests. |
 | `ringBufferCapacity` | adapter-negotiated (~2 GB) | GPU memory for decoded points. More = more simultaneous chunks visible. |
 | `splatRadius` | `2` | Point size: `1`=1 px, `2`=3×3 px, `3`=5×5 px. |
+| `voxelLod` | `true` | Runtime voxel LOD "sediment layer": over-covered chunks render a coarse-to-fine voxel prefix instead of every point, and a ~15 KB/chunk coarse ghost persists across eviction. Set `false` to disable. |
 | `assetUrls` | auto | Override laz-perf WASM/worker URLs for CDN or custom hosting. |
 | `colorMode` | file-derived | Initial colour mode: `'rgb'` \| `'height'` \| `'intensity'` \| `'classification'`. Defaults to `'rgb'` if the file has native colour, else `'height'`. |
 | `onStateChange` | — | `(state: string, message?: string) => void` |
