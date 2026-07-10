@@ -22,7 +22,7 @@ export { StreamingEngine } from './engine/streaming-engine.js'
 export type { EngineEvents, LoadState, RingBufferProvider, StreamingEngineOptions } from './engine/streaming-engine.js'
 
 // ── Provider types — implement these in your renderer ────────────────────────
-export type { CameraInfo } from './decode/chunk-priority.js'
+export type { CameraInfo, ChunkOrdering, VisibilityTest } from './decode/chunk-priority.js'
 export type { LazstreamAssetUrls } from './decode/worker-pool.js'
 
 // ── Data types — what flows out of the engine ────────────────────────────────

@@ -23,7 +23,7 @@ import { fetchAndParseLasHeader, ParseError } from './header-parser.js'
 import { fetchChunkTable, fetchSeedPoints } from './chunk-table.js'
 import { WorkerPool } from '../decode/worker-pool.js'
 import type { DecodedChunk, LazstreamAssetUrls } from '../decode/worker-pool.js'
-import { ChunkPrioritiser, type CameraInfo } from '../decode/chunk-priority.js'
+import { ChunkPrioritiser, type CameraInfo, type ChunkOrdering, type VisibilityTest } from '../decode/chunk-priority.js'
 import { SpatialIndex } from './spatial-index.js'
 import { ChunkCache, makeCacheKey } from '../cache/idb-cache.js'
 
@@ -80,6 +80,8 @@ export interface StreamingEngineOptions {
   sseThreshold?: number
   /** Max concurrent HTTP range requests. Default: min(workerCount × 4, 128). */
   maxFetches?: number
+  /** Decode queue ordering strategy (priority-ordering spike). Default: 'sse'. */
+  chunkOrdering?: ChunkOrdering
   /** Asset URL overrides — only needed for non-standard hosting or CDN prefixes. */
   assetUrls?: LazstreamAssetUrls
 }
@@ -102,11 +104,13 @@ export class StreamingEngine {
   private cameraInfoProvider:  (() => CameraInfo)        | null = null
   private frustumProvider:     (() => BBox3D)            | null = null
   private ringBufferProvider:  RingBufferProvider        | null = null
+  private visibilityProvider:  VisibilityTest            | null = null
 
   private cache: ChunkCache | null = null
 
   private workerCount: number
   private readonly sseThreshold: number | undefined
+  private readonly chunkOrdering: ChunkOrdering
   private readonly assetUrls: LazstreamAssetUrls | undefined
   /** True once workerPool.init() AND workerPool.configure() have both returned. Guards updateCamera(). */
   private workersConfigured = false
@@ -120,18 +124,20 @@ export class StreamingEngine {
   private maxFetches: number
 
   constructor(options: StreamingEngineOptions = {}) {
-    const { events = {}, workerCount, cache, sseThreshold, maxFetches, assetUrls } = options
+    const { events = {}, workerCount, cache, sseThreshold, maxFetches, assetUrls, chunkOrdering } = options
     this.events = events
     this.workerCount = workerCount ?? Math.min(100, Math.max(1, navigator.hardwareConcurrency - 1))
     this.maxFetches  = maxFetches  ?? Math.min(this.workerCount * 4, 128)
     this.cache = cache ?? null
     this.sseThreshold = sseThreshold
+    this.chunkOrdering = chunkOrdering ?? 'sse'
     this.assetUrls = assetUrls
     console.debug('[lazstream] StreamingEngine:', {
       workerCount: this.workerCount,
       maxFetches: this.maxFetches,
       cacheEnabled: this.cache !== null,
       sseThreshold: this.sseThreshold ?? '(default)',
+      chunkOrdering: this.chunkOrdering,
     })
   }
 
@@ -149,6 +155,14 @@ export class StreamingEngine {
    *  to avoid filling the buffer with chunks that can't land (all slots visible). */
   setRingBufferProvider(provider: RingBufferProvider): void {
     this.ringBufferProvider = provider
+  }
+
+  /** Register an exact-visibility test (renderer's 6-plane frustum vs world
+   *  AABB). Optional: without it the engine falls back to the loose frustum
+   *  AABB alone, which at ground-level views admits chunks the renderer
+   *  immediately culls — decode → evict → re-queue churn. */
+  setVisibilityProvider(provider: VisibilityTest): void {
+    this.visibilityProvider = provider
   }
 
   /** Called by the renderer when a chunk is proactively evicted from the GPU
@@ -303,7 +317,9 @@ export class StreamingEngine {
 
     const camera = this.cameraInfoProvider()
     const frustumBBox = this.frustumProvider()
-    const ranked = this.prioritiser.prioritise(frustumBBox, camera, slots)
+    const ranked = this.prioritiser.prioritise(
+      frustumBBox, camera, slots, this.visibilityProvider ?? undefined,
+    )
     if (ranked.length === 0) return
 
     // Sync filter + claim. We add to `fetching` before any await so subsequent
@@ -409,6 +425,7 @@ export class StreamingEngine {
     this.cameraInfoProvider = null
     this.frustumProvider = null
     this.ringBufferProvider = null
+    this.visibilityProvider = null
     this.workersConfigured = false
   }
 
@@ -548,7 +565,12 @@ export class StreamingEngine {
     }))
 
     this.spatial.buildFromSeeds(seedXYZ, fileBBox)
-    this.prioritiser = new ChunkPrioritiser(this.spatial, this.sseThreshold)
+    this.prioritiser = new ChunkPrioritiser(
+      this.spatial,
+      this.sseThreshold,
+      this.chunkOrdering,
+      { seeds: seedXYZ, fileBBox },
+    )
   }
 
   private handleChunkDecoded(chunk: DecodedChunk): void {
