@@ -20,12 +20,12 @@ import type {
   PointAttributes,
   CameraState,
 } from '@lazstream/core'
-import { WebGPURenderer, WebGPUUnsupportedError } from './render/webgpu-renderer.js'
-import type { ColorMode } from './render/webgpu-renderer.js'
+import { WebGPURenderer, WebGPUUnsupportedError, GpuOutOfMemoryError } from './render/webgpu-renderer.js'
+import type { ColorMode, GpuMemoryBudget, GpuFault } from './render/webgpu-renderer.js'
 import type { RawPick } from './render/picking.js'
 
-export { WebGPUUnsupportedError }
-export type { PointAttributes, ColorMode, CameraState }
+export { WebGPUUnsupportedError, GpuOutOfMemoryError }
+export type { PointAttributes, ColorMode, CameraState, GpuMemoryBudget, GpuFault }
 
 /**
  * Resolved pick result exposed to application code.
@@ -42,8 +42,31 @@ export interface PickResult {
 }
 
 export interface ViewerOptions {
-  /** GPU ring buffer capacity in bytes. Default: adapter-negotiated (~2 GB). */
+  /**
+   * GPU ring buffer capacity in bytes. Default: adapter-negotiated (~2 GB).
+   * If the GPU cannot allocate it, the size is halved and retried down to
+   * `minRingBufferCapacity` — see `onGpuMemoryReduced`.
+   */
   ringBufferCapacity?: number
+  /**
+   * Smallest ring buffer the out-of-memory backoff will try. If even this
+   * fails, `create()` rejects with GpuOutOfMemoryError. Default: 128 MB.
+   */
+  minRingBufferCapacity?: number
+  /**
+   * Fires once during `create()` when the GPU could not allocate the requested
+   * ring buffer and the viewer started with a smaller one. Fewer chunks stay
+   * resident; show e.g. "Running with reduced GPU memory". The same data is
+   * available afterwards via `viewer.gpuMemoryBudget`.
+   */
+  onGpuMemoryReduced?: (budget: GpuMemoryBudget) => void
+  /**
+   * Fires once if the GPU fails after start-up — a runtime out-of-memory
+   * (e.g. resizing to a very large canvas) or device loss (driver reset,
+   * integrated-GPU memory exhaustion). Rendering and streaming stop; the
+   * canvas keeps its last frame. Recreate the viewer (or reload) to recover.
+   */
+  onGpuFault?: (fault: GpuFault) => void
   /** Min screen-space error to trigger chunk decode. Default: 10.0. */
   sseThreshold?: number
   /** Decode worker count. Default: hardwareConcurrency - 1. */
@@ -112,15 +135,34 @@ export class LazstreamViewer {
 
   /**
    * Create a viewer attached to a canvas element.
-   * Throws WebGPUUnsupportedError if WebGPU is unavailable.
+   * Throws WebGPUUnsupportedError if WebGPU is unavailable, or
+   * GpuOutOfMemoryError if not even `minRingBufferCapacity` can be allocated.
    */
   static async create(canvas: HTMLCanvasElement, options: ViewerOptions = {}): Promise<LazstreamViewer> {
+    // The renderer arms its fault watchers before returning, so a fault can in
+    // principle land before `viewer` exists — hold it and replay below.
+    let viewer: LazstreamViewer | null = null
+    let earlyFault: GpuFault | null = null
     const renderer = await WebGPURenderer.create(canvas, {
-      ringBufferCapacity: options.ringBufferCapacity,
+      ringBufferCapacity:    options.ringBufferCapacity,
+      minRingBufferCapacity: options.minRingBufferCapacity,
       voxelLod: options.voxelLod,
+      onGpuFault: (fault) => {
+        if (viewer) viewer.handleGpuFault(fault)
+        else earlyFault = fault
+      },
     })
     if (options.splatRadius !== undefined) renderer.setSplatRadius(options.splatRadius)
-    return new LazstreamViewer(renderer, options)
+    viewer = new LazstreamViewer(renderer, options)
+    const budget = renderer.gpuMemoryBudget
+    if (budget.reduced) options.onGpuMemoryReduced?.(budget)
+    if (earlyFault) viewer.handleGpuFault(earlyFault)
+    return viewer
+  }
+
+  /** Ring buffer budget in effect, and whether OOM backoff reduced it. */
+  get gpuMemoryBudget(): GpuMemoryBudget {
+    return this.renderer.gpuMemoryBudget
   }
 
   /**
@@ -320,6 +362,13 @@ export class LazstreamViewer {
   get session(): ManifestSession | null { return this.activeSession }
 
   // ─── Internal ──────────────────────────────────────────────────────────────
+
+  /** Stop streaming (nothing can be drawn any more) and notify the host. */
+  private handleGpuFault(fault: GpuFault): void {
+    this.activeSession?.dispose()
+    this.activeSession = null
+    this.options.onGpuFault?.(fault)
+  }
 
   private startDecodeLoop(session: ManifestSession): void {
     let running = true

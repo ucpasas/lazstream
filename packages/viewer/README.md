@@ -56,7 +56,10 @@ Pass options to `LazstreamViewer.create(canvas, options)`.
 | `sseThreshold` | `10.0` | Minimum screen-space error (px) before a chunk decodes. Lower = decodes from farther away; higher = zoom-to-reveal. |
 | `workerCount` | `hardwareConcurrency - 1` | Decode worker threads. Reduce for pages sharing CPU with other heavy JS. |
 | `maxFetches` | `workerCount × 4` | Max concurrent HTTP range requests. |
-| `ringBufferCapacity` | adapter-negotiated (~2 GB) | GPU memory for decoded points. More = more simultaneous chunks visible. |
+| `ringBufferCapacity` | adapter-negotiated (~2 GB) | GPU memory for decoded points. More = more simultaneous chunks visible. Halved automatically if the GPU can't allocate it. |
+| `minRingBufferCapacity` | 128 MB | Smallest size the out-of-memory backoff will try before `create()` rejects with `GpuOutOfMemoryError`. |
+| `onGpuMemoryReduced` | — | `(budget: GpuMemoryBudget) => void` — fired once from `create()` when a smaller buffer had to be used. |
+| `onGpuFault` | — | `(fault: GpuFault) => void` — runtime GPU out-of-memory or device loss; rendering and streaming stop. |
 | `splatRadius` | `2` | Point size: `1`=1 px, `2`=3×3 px, `3`=5×5 px. |
 | `voxelLod` | `true` | Runtime voxel LOD "sediment layer": over-covered chunks render a coarse-to-fine voxel prefix instead of every point, and a ~15 KB/chunk coarse ghost persists across eviction. Set `false` to disable. |
 | `assetUrls` | auto | Override laz-perf WASM/worker URLs for CDN or custom hosting. |
@@ -96,6 +99,12 @@ await LazstreamViewer.create(canvas, {
 | 512 MB | ~37 M |
 | 1 GB | ~73 M |
 | 2 GB (default) | ~146 M |
+
+The requested size is what the GPU can *address*, not what is free. On laptop
+and integrated GPUs the allocation can fail. When it does, the viewer halves the
+size and retries (2 GB → 1 GB → 512 MB → 256 MB → 128 MB). If a smaller size
+works, the viewer starts normally and fires `onGpuMemoryReduced`. Read
+`viewer.gpuMemoryBudget` at any time for `{ requestedBytes, effectiveBytes, reduced, attempts }`.
 
 ### `splatRadius` — point size
 
@@ -278,19 +287,28 @@ The viewer detects manifests by file extension and routes to `ManifestSession` a
 ## Error handling
 
 ```typescript
-import { LazstreamViewer, WebGPUUnsupportedError } from '@lazstream/viewer'
+import { LazstreamViewer, WebGPUUnsupportedError, GpuOutOfMemoryError } from '@lazstream/viewer'
 
 try {
   const viewer = await LazstreamViewer.create(canvas, {
     onError: (err) => console.error('stream error:', err),
+    onGpuMemoryReduced: (b) =>
+      showNotice(`Running with reduced GPU memory (${b.effectiveBytes >> 20} MB)`),
+    onGpuFault: (fault) =>
+      // 'out-of-memory' | 'device-lost' — rendering has stopped; offer a reload
+      showError(`GPU failure (${fault.kind}): ${fault.message}`),
   })
   await viewer.load(url)
 } catch (err) {
   if (err instanceof WebGPUUnsupportedError) {
     // WebGPU not available — show fallback
+  } else if (err instanceof GpuOutOfMemoryError) {
+    // Not even the minimum GPU buffer could be allocated — err.message explains
   }
 }
 ```
+
+The SDK never displays GPU notices itself — your app decides how to present them.
 
 ---
 

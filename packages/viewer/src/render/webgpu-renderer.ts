@@ -37,8 +37,11 @@ import depthShaderSgSrc from './shaders/points-depth-sgdedup.wgsl?raw'
 import clearShaderSrc   from './shaders/clear-depth.wgsl?raw'
 import resolveShaderSrc from './shaders/resolve-edl.wgsl?raw'
 
-import { createWebGPUContext, type WebGPUContext } from './webgpu-context'
+import { createWebGPUContext, MIN_RING_BUFFER_BYTES, type WebGPUContext } from './webgpu-context'
 export { WebGPUUnsupportedError } from './webgpu-context'
+import { allocateWithBackoff, type GpuMemoryBudget, type GpuFault } from './gpu-budget'
+export { GpuOutOfMemoryError } from './gpu-budget'
+export type { GpuMemoryBudget, GpuFault } from './gpu-budget'
 import { GpuPassTiming } from './gpu-pass-timing'
 import { RingBufferAllocator } from './ring-buffer'
 import {
@@ -126,8 +129,16 @@ const VIEWPORT_UNIFORM_BYTES = 16 // vec2 + f32 + f32
 // --- Types -------------------------------------------------------------------
 
 export interface WebGPURendererOptions {
-  /** Override ring buffer size in bytes. Defaults to context.ringBufferCapacity. */
+  /** Override ring buffer size in bytes. Defaults to context.ringBufferCapacity.
+   *  Clamped to the device's buffer limits; halved on allocation failure. */
   ringBufferCapacity?: number
+  /** Smallest ring buffer size the OOM backoff will try before giving up with
+   *  GpuOutOfMemoryError. Default 128 MB. */
+  minRingBufferCapacity?: number
+  /** Fires once if the GPU fails after initialisation (runtime out-of-memory
+   *  or device loss). The renderer stops drawing; the host decides what to
+   *  show and whether to reload. */
+  onGpuFault?:  (fault: GpuFault) => void
   edlStrength?: number   // default 200
   edlRadius?:   number   // default 1
   onFrame?:     (info: FrameInfo) => void
@@ -276,6 +287,22 @@ export class WebGPURenderer {
   private rafHandle: number | null = null
   private resizeObserver: ResizeObserver | null = null
   private disposed = false
+  // OOM-safety state. `started` flips once the init error scope has popped
+  // clean (see create()); before that, allocations belong to the init scope.
+  // `pendingAllocChecks` gates GPU submission while a post-start allocation
+  // (viewport resize) is awaiting its error scope, so a failed allocation is
+  // never bound. `faulted` halts the renderer permanently.
+  private started = false
+  private pendingAllocChecks = 0
+  private faulted = false
+  private budget!: GpuMemoryBudget
+  private readonly onGpuFault?: (fault: GpuFault) => void
+  private readonly handleUncapturedError = (ev: Event): void => {
+    const error = (ev as GPUUncapturedErrorEvent).error
+    if (typeof GPUOutOfMemoryError !== 'undefined' && error instanceof GPUOutOfMemoryError) {
+      this.fault({ kind: 'out-of-memory', message: error.message })
+    }
+  }
   private realChunkCount = 0
   // Dirty flag — true means GPU work is needed this frame. Set by:
   //   controls 'change' (camera moved or damping settling),
@@ -345,12 +372,19 @@ export class WebGPURenderer {
 
   // --- Constructor / factory ------------------------------------------------
 
-  private constructor(ctx: WebGPUContext, options: WebGPURendererOptions) {
+  /**
+   * Allocates every GPU resource but does NOT start the frame loop — create()
+   * runs this inside an 'out-of-memory' error scope and only calls start()
+   * once the scope pops clean. On OOM the instance is disposed and rebuilt
+   * with a halved `ringCapacity`, so a partial allocation never survives.
+   */
+  private constructor(ctx: WebGPUContext, options: WebGPURendererOptions, ringCapacity: number) {
     this.ctx = ctx
     this.device = ctx.device
     this.edlStrength = options.edlStrength ?? 600
     this.edlRadius   = options.edlRadius   ?? 1
     this.onFrame     = options.onFrame
+    this.onGpuFault  = options.onGpuFault
 
     if (options.gpuTiming && ctx.hasTimestampQuery) {
       this.gpuTiming = new GpuPassTiming(ctx.device)
@@ -361,7 +395,6 @@ export class WebGPURenderer {
       this.gpuTiming = null
     }
 
-    const ringCapacity = options.ringBufferCapacity ?? ctx.ringBufferCapacity
     // Voxel LOD: carve the sediment pool off the tail of the ring buffer so
     // both regions live in the one GPU buffer the shaders already bind.
     // Tier structure needs grid divisible by 4.
@@ -371,9 +404,14 @@ export class WebGPURenderer {
     this.voxelExitPx  = options.voxelSwitchPx !== undefined
       ? options.voxelSwitchPx * 1.25
       : VOXEL_EXIT_PX
+    // An explicit voxelPoolBytes is capped at half the ring: after an OOM
+    // backoff the ring may be far smaller than the override assumed, and an
+    // oversized pool would push voxelPoolBase negative.
     const voxelPoolBytes = options.voxelLod !== false
-      ? Math.floor((options.voxelPoolBytes ??
-          Math.min(VOXEL_POOL_MAX_BYTES, ringCapacity / 8)) / 4) * 4
+      ? Math.floor(Math.min(
+          options.voxelPoolBytes ?? Math.min(VOXEL_POOL_MAX_BYTES, ringCapacity / 8),
+          ringCapacity / 2,
+        ) / 4) * 4
       : 0
     this.voxelPoolBase = ringCapacity - voxelPoolBytes
     this.voxelPool = voxelPoolBytes > 0 ? new RingBufferAllocator(voxelPoolBytes) : null
@@ -535,21 +573,58 @@ export class WebGPURenderer {
 
     // --- Viewport setup ---------------------------------------------------
     this.handleResize(ctx.canvas.clientWidth, ctx.canvas.clientHeight)
+
+    // --- Picking click listener -------------------------------------------
+    ctx.canvas.addEventListener('pointerdown', this.handleCanvasClick)
+
+    this.writeViewportUniform()
+    this.writeColorParams()
+  }
+
+  /** Begin observing resizes, watching for GPU faults, and drawing frames.
+   *  Called by create() only after every init allocation is confirmed. */
+  private start(): void {
+    this.started = true
     this.resizeObserver = new ResizeObserver((entries) => {
       for (const e of entries) {
         const cr = e.contentRect
         this.handleResize(cr.width, cr.height)
       }
     })
-    this.resizeObserver.observe(ctx.canvas)
+    this.resizeObserver.observe(this.ctx.canvas)
 
-    // --- Picking click listener -------------------------------------------
-    ctx.canvas.addEventListener('pointerdown', this.handleCanvasClick)
+    this.device.addEventListener('uncapturederror', this.handleUncapturedError)
+    // Integrated GPUs share system memory, so an oversized allocation often
+    // "succeeds" and the failure surfaces later as device loss instead of an
+    // OOM error — this is the only signal on that path.
+    void this.device.lost.then((info) => {
+      if (this.disposed || info.reason === 'destroyed') return
+      this.fault({ kind: 'device-lost', reason: info.reason, message: info.message })
+    })
 
-    // --- Start frame loop -------------------------------------------------
-    this.writeViewportUniform()
-    this.writeColorParams()
     this.rafHandle = requestAnimationFrame(this.renderFrame)
+  }
+
+  /** Halt permanently on an unrecoverable GPU failure and notify the host.
+   *  Idempotent — only the first fault is reported. */
+  private fault(fault: GpuFault): void {
+    if (this.faulted || this.disposed) return
+    this.faulted = true
+    if (this.rafHandle !== null) cancelAnimationFrame(this.rafHandle)
+    this.rafHandle = null
+    console.error(`[webgpu] GPU fault (${fault.kind}) — rendering halted:`, fault.message)
+    this.onGpuFault?.(fault)
+  }
+
+  /** Ring buffer budget actually allocated, and whether OOM backoff reduced
+   *  it. Hosts use `reduced` to show a "reduced GPU memory" notice. */
+  get gpuMemoryBudget(): GpuMemoryBudget {
+    return { ...this.budget }
+  }
+
+  /** True once a GPU fault has halted the renderer. */
+  get isFaulted(): boolean {
+    return this.faulted
   }
 
   static async create(
@@ -563,7 +638,66 @@ export class WebGPURenderer {
     const ctx = await createWebGPUContext(canvas, {
       targetCapacityBytes: options.ringBufferCapacity,
     })
-    return new WebGPURenderer(ctx, options)
+    const { device } = ctx
+
+    // Initial budget. An explicit override is honoured as given (even below
+    // the context's 128 MB target floor, as before) but clamped to the
+    // device's buffer limits — an over-limit size fails validation and yields
+    // the same invalid-buffer cascade as an OOM.
+    const deviceLimit = Math.min(
+      device.limits.maxStorageBufferBindingSize,
+      device.limits.maxBufferSize,
+    )
+    const initialBytes = options.ringBufferCapacity !== undefined
+      ? Math.min(options.ringBufferCapacity, deviceLimit)
+      : ctx.ringBufferCapacity
+    const floorBytes = options.minRingBufferCapacity ?? MIN_RING_BUFFER_BYTES
+
+    try {
+      const { value: renderer, budget } = await allocateWithBackoff(
+        initialBytes,
+        floorBytes,
+        async (bytes) => {
+          device.pushErrorScope('out-of-memory')
+          let renderer: WebGPURenderer | null = null
+          let thrown: unknown = null
+          try {
+            renderer = new WebGPURenderer(ctx, options, bytes)
+          } catch (err) {
+            thrown = err
+          }
+          // Always pop — an unbalanced scope would swallow later errors.
+          const oom = await device.popErrorScope()
+          if (thrown !== null) {
+            throw thrown instanceof Error ? thrown : new Error(String(thrown))
+          }
+          if (oom) {
+            console.warn(
+              `[webgpu] out of memory allocating ${Math.round(bytes / 1024 / 1024)} MB ` +
+              `ring buffer — retrying smaller:`, oom.message,
+            )
+            renderer!.dispose()
+            return null
+          }
+          return renderer
+        },
+      )
+      renderer.budget = budget
+      if (budget.reduced) {
+        console.warn(
+          `[webgpu] running with reduced GPU memory: ring buffer ` +
+          `${Math.round(budget.effectiveBytes / 1024 / 1024)} MB ` +
+          `(requested ${Math.round(budget.requestedBytes / 1024 / 1024)} MB, ` +
+          `${budget.attempts} attempts)`,
+        )
+      }
+      renderer.start()
+      return renderer
+    } catch (err) {
+      // Nothing of ours is left allocated; release the canvas swapchain too.
+      ctx.context.unconfigure()
+      throw err
+    }
   }
 
   // --- Public API -----------------------------------------------------------
@@ -994,7 +1128,7 @@ export class WebGPURenderer {
    * (clip-space z in [-1,1]), so we remap: ndcZ = storedDepth * 2 - 1.
    */
   private handleCanvasClick = async (e: PointerEvent): Promise<void> => {
-    if (this.pickInFlight || this.disposed || !this.onPointPicked) return
+    if (this.pickInFlight || this.disposed || this.faulted || !this.onPointPicked) return
     this.pickInFlight = true
 
     let depthMapped = false
@@ -1209,6 +1343,7 @@ export class WebGPURenderer {
     this.disposed = true
     if (this.rafHandle !== null) cancelAnimationFrame(this.rafHandle)
     this.resizeObserver?.disconnect()
+    this.device.removeEventListener('uncapturederror', this.handleUncapturedError)
     this.ctx.canvas.removeEventListener('pointerdown', this.handleCanvasClick)
     this.controls.dispose()
     // GPU resources are released when the device is GC'd. We explicitly
@@ -1519,6 +1654,12 @@ private evictInvisibleSlots(): void {
     const pixelCount = w * h
     const sizeBytes  = pixelCount * 4
 
+    // After start(), viewport buffers are allocated outside the init scope, so
+    // check them here. (Before start(), a nested scope would hide the error
+    // from create()'s backoff loop.)
+    const checked = this.started
+    if (checked) this.device.pushErrorScope('out-of-memory')
+
     this.depthBuffer = this.device.createBuffer({
       label: 'lazstream/depth',
       // COPY_SRC added for T1 picking (copyBufferToBuffer to staging buffer)
@@ -1533,6 +1674,22 @@ private evictInvisibleSlots(): void {
       size: sizeBytes,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
     })
+
+    if (checked) {
+      this.pendingAllocChecks++
+      this.device.popErrorScope().then((oom) => {
+        this.pendingAllocChecks--
+        if (oom) {
+          this.fault({
+            kind: 'out-of-memory',
+            message: `viewport buffers (${w}×${h}): ${oom.message}`,
+          })
+        }
+      }, () => {
+        // Rejects only if the device is gone — device.lost reports that.
+        this.pendingAllocChecks--
+      })
+    }
 
     this.rebuildBindGroups()
     this.writeViewportUniform()
@@ -1625,12 +1782,16 @@ private evictInvisibleSlots(): void {
   // --- Frame loop -----------------------------------------------------------
 
   private renderFrame = (): void => {
-    if (this.disposed) return
+    if (this.disposed || this.faulted) return
     this.rafHandle = requestAnimationFrame(this.renderFrame)
 
     // controls.update() drives damping animation; it fires the 'change' event
     // (which sets needsRender) for as long as damping is still settling.
     this.controls.update()
+
+    // A viewport reallocation is awaiting its OOM check — don't bind buffers
+    // that may be invalid. needsRender is left set, so we draw once it clears.
+    if (this.pendingAllocChecks > 0) return
 
     // Skip all GPU work when nothing has changed and no chunks are waiting.
     if (!this.needsRender && this.deferredChunks.length === 0) return

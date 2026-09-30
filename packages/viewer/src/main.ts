@@ -36,6 +36,8 @@
  *   ?voxelPoolMB=N     voxel sediment pool size (default min(256, ring/8) MB)
  *   ?voxelPx=X         voxel switch-in threshold, projected px/fine-cell
  *                      (default 0.8)
+ *   ?simOOM=N          dev: simulate GPU out-of-memory for buffers > N MB
+ *                      (exercises the ring-buffer backoff / fault notices)
  *
  * URL fragment:
  *   #v=<base64url>     encoded ViewState (source + camera + colorMode) — takes priority
@@ -49,8 +51,8 @@
 import { ManifestSession, fetchManifest, urlToManifest, validateManifestUrl, getEntryFromParams, encodeViewState, decodeViewState, CorsError } from '@lazstream/core'
 import type { ManifestSessionOptions, Manifest, CameraState, ChunkOrdering } from '@lazstream/core'
 import type { CameraBench } from './dev/camera-bench.js'
-import { WebGPURenderer, WebGPUUnsupportedError } from './render/webgpu-renderer.js'
-import type { ColorMode } from './render/webgpu-renderer.js'
+import { WebGPURenderer, WebGPUUnsupportedError, GpuOutOfMemoryError } from './render/webgpu-renderer.js'
+import type { ColorMode, GpuFault } from './render/webgpu-renderer.js'
 // ?worker&url: Vite compiles decode-worker.ts as a module worker and returns its
 // URL — hashed JS in prod, dev-server URL in dev. Bypasses the @vite-ignore default
 // in WorkerPool so the viewer never relies on the fallback path.
@@ -69,6 +71,13 @@ const statsEl       = document.getElementById('stats')        as HTMLElement
 const progressEl    = document.getElementById('progress')     as HTMLElement
 const warningEl     = document.getElementById('warning')      as HTMLElement
 const attributionEl = document.getElementById('attribution')  as HTMLElement
+const gpuNoticeEl   = document.getElementById('gpu-notice')   as HTMLElement
+
+function showGpuNotice(text: string, isError: boolean): void {
+  gpuNoticeEl.textContent = text
+  gpuNoticeEl.classList.toggle('gpu-notice--error', isError)
+  gpuNoticeEl.hidden = false
+}
 
 // ─── Bootstrap ───────────────────────────────────────────────────────────────
 
@@ -122,6 +131,14 @@ async function main(): Promise<void> {
   // gate cuts post-settle wasted fetch from ~81-100% to ~8-19% and breaks the
   // perpetual decode→evict→re-queue churn at ground-level views.
   const exactCull = urlParams.get('exactCull') !== '0'
+
+  // ─── GPU OOM simulator (dev-only, loaded only when ?simOOM present) ───────
+
+  const simOomParam = urlParams.get('simOOM')
+  if (simOomParam !== null && Number.isFinite(parseFloat(simOomParam))) {
+    const { installOomSimulator } = await import('./dev/simulate-oom.js')
+    installOomSimulator(parseFloat(simOomParam))
+  }
 
   // ─── Fetch-timing diagnostic (dev-only, tree-shaken when ?timing absent) ──
 
@@ -237,6 +254,21 @@ async function main(): Promise<void> {
       voxelGrid,
       voxelPoolBytes,
       voxelSwitchPx,
+      onGpuFault(fault: GpuFault) {
+        // Nothing more can be drawn — stop streaming and say why.
+        activeSession?.dispose()
+        activeSession = null
+        statusEl.textContent = fault.kind === 'device-lost' ? 'GPU device lost' : 'GPU out of memory'
+        statusEl.className = 'status status--error'
+        showGpuNotice(
+          fault.kind === 'device-lost'
+            ? '⚠ The GPU stopped responding (often GPU memory exhaustion on integrated ' +
+              'or laptop GPUs). Reload the page; if it recurs, try ?bufferMB=512.'
+            : '⚠ The GPU ran out of memory and rendering stopped. Reload the page; ' +
+              'if it recurs, try ?bufferMB=512 or a smaller window.',
+          true,
+        )
+      },
       onFrame({ slots, pointsLoaded }) {
         statsEl.textContent =
           `${slots} chunks · ${pointsLoaded.toLocaleString()} pts`
@@ -250,7 +282,24 @@ async function main(): Promise<void> {
       loadBtn.disabled = true
       return
     }
+    if (err instanceof GpuOutOfMemoryError) {
+      statusEl.textContent = 'Not enough GPU memory'
+      statusEl.className = 'status status--error'
+      showGpuNotice(`⚠ ${err.message}`, true)
+      loadBtn.disabled = true
+      return
+    }
     throw err
+  }
+
+  const gpuBudget = renderer.gpuMemoryBudget
+  if (gpuBudget.reduced) {
+    showGpuNotice(
+      `Running with reduced GPU memory: ${Math.round(gpuBudget.effectiveBytes / 1024 / 1024)} MB ` +
+      `of ${Math.round(gpuBudget.requestedBytes / 1024 / 1024)} MB requested. ` +
+      `Fewer chunks stay resident at once.`,
+      false,
+    )
   }
 
   if (splatRadius !== undefined) renderer.setSplatRadius(splatRadius)
