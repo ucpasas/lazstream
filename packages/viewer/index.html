@@ -203,6 +203,28 @@
       text-align: center;
     }
 
+    /* ── GPU memory notice (persists across loads, unlike #warning) ── */
+    #gpu-notice {
+      position: fixed;
+      bottom: 44px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(255, 179, 71, 0.12);
+      border: 1px solid rgba(255, 179, 71, 0.4);
+      color: var(--warning);
+      font-size: 11px;
+      padding: 6px 14px;
+      border-radius: var(--radius);
+      z-index: 98;
+      max-width: 600px;
+      text-align: center;
+    }
+    #gpu-notice.gpu-notice--error {
+      background: rgba(255, 80, 80, 0.12);
+      border-color: var(--error);
+      color: var(--error);
+    }
+
     /* ── Crosshair overlay ── */
     #crosshair {
       position: fixed;
@@ -305,6 +327,9 @@
 
   <!-- Warning banner (LAZ version, CORS issues) -->
   <div id="warning"></div>
+
+  <!-- GPU memory notice (reduced budget, out of memory, device lost) -->
+  <div id="gpu-notice" hidden></div>
 
   <!-- Attribution (shown when manifest provides it) -->
   <div id="attribution"></div>

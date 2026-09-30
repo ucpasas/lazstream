@@ -58,10 +58,27 @@ jobs:
       # --provenance: OIDC token authenticates the publish AND attaches a
       #   Sigstore attestation linking the package to this exact commit and run.
       # --no-git-checks: CI checkout is always clean; these checks are redundant.
+      # Packages are versioned independently — a package whose local version
+      # is already on the registry was not bumped this release, so skip it
+      # instead of failing with a 403 (which would also block later steps).
       - name: Publish @lazstream/core
-        run: pnpm publish --provenance --no-git-checks
+        run: |
+          NAME=$(node -p "require('./package.json').name")
+          VERSION=$(node -p "require('./package.json').version")
+          if [ "$(npm view "$NAME@$VERSION" version 2>/dev/null)" = "$VERSION" ]; then
+            echo "$NAME@$VERSION already published — skipping"
+          else
+            pnpm publish --provenance --no-git-checks
+          fi
         working-directory: packages/core
 
       - name: Publish @lazstream/viewer
-        run: pnpm publish --provenance --no-git-checks
+        run: |
+          NAME=$(node -p "require('./package.json').name")
+          VERSION=$(node -p "require('./package.json').version")
+          if [ "$(npm view "$NAME@$VERSION" version 2>/dev/null)" = "$VERSION" ]; then
+            echo "$NAME@$VERSION already published — skipping"
+          else
+            pnpm publish --provenance --no-git-checks
+          fi
         working-directory: packages/viewer

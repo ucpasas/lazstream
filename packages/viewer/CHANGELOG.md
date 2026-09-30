@@ -1,3 +1,29 @@
+## 1.5.0 — 2026-09-30
+
+### Fixed
+- **GPU out-of-memory on low-VRAM laptop and integrated GPUs no longer fails
+  silently.** The ring buffer was sized from the device's addressable limits,
+  not from free memory. A failed allocation left invalid buffers behind, which
+  caused cascading WebGPU errors and a blank canvas with no message. The
+  renderer now allocates inside an `'out-of-memory'` error scope. On failure it
+  halves the ring buffer and retries (2 GB → … → 128 MB). A partially
+  allocated renderer is never started.
+- A `ringBufferCapacity` override above the device's buffer limit is now
+  clamped. It used to skip the clamp and produce invalid buffers.
+- An explicit voxel pool size can no longer exceed half of a reduced ring buffer.
+
+### Added
+- `ViewerOptions.minRingBufferCapacity`: the floor for the out-of-memory
+  backoff (default 128 MB).
+- `ViewerOptions.onGpuMemoryReduced(budget)`, fired once when the viewer starts
+  with a smaller buffer than requested. Also added `viewer.gpuMemoryBudget`.
+- `ViewerOptions.onGpuFault(fault)`, fired on runtime GPU out-of-memory or
+  device loss. The viewer stops rendering and streaming, and the app decides
+  what to show.
+- `GpuOutOfMemoryError`, thrown by `LazstreamViewer.create()` when even the
+  floor cannot be allocated. `GpuMemoryBudget` and `GpuFault` types are now
+  exported.
+
 ## 1.3.1 — 2026-06-26
 
 ### Fixed

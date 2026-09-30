@@ -49,7 +49,7 @@ export interface WebGPUContext {
  * point data that the renderer can't usefully do its job. We refuse to
  * start in this case.
  */
-const MIN_RING_BUFFER_BYTES = 128 * 1024 * 1024  // 128 MB
+export const MIN_RING_BUFFER_BYTES = 128 * 1024 * 1024  // 128 MB
 
 /**
  * Default target ring buffer size when caller doesn't specify. 2 GB is
