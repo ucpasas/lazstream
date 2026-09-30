@@ -135,9 +135,9 @@ async function main(): Promise<void> {
   // ─── GPU OOM simulator (dev-only, loaded only when ?simOOM present) ───────
 
   const simOomParam = urlParams.get('simOOM')
-  if (simOomParam !== null && Number.isFinite(parseFloat(simOomParam))) {
+  if (simOomParam !== null && Number.isFinite(Number.parseFloat(simOomParam))) {
     const { installOomSimulator } = await import('./dev/simulate-oom.js')
-    installOomSimulator(parseFloat(simOomParam))
+    installOomSimulator(Number.parseFloat(simOomParam))
   }
 
   // ─── Fetch-timing diagnostic (dev-only, tree-shaken when ?timing absent) ──
@@ -526,7 +526,7 @@ async function main(): Promise<void> {
 
   loadBtn.addEventListener('click', () => {
     const url = urlInput.value.trim() || DEFAULT_URL
-    loadUrl(url)
+    loadUrl(url).catch(displayError)
   })
 
   urlInput.addEventListener('keydown', (e) => {
@@ -539,12 +539,18 @@ async function main(): Promise<void> {
   if (hashSource) {
     urlInput.value = hashSource
     const type = hashSource.toLowerCase().endsWith('.lazm.json') ? 'manifest' : 'laz'
-    loadUrl(hashSource, type as 'laz' | 'manifest')
+    loadUrl(hashSource, type as 'laz' | 'manifest').catch(displayError)
   } else {
     const entry = getEntryFromParams()
     urlInput.value = entry?.url ?? DEFAULT_URL
-    if (entry) loadUrl(entry.url, entry.type)
+    if (entry) loadUrl(entry.url, entry.type).catch(displayError)
   }
 }
 
-main()
+main().catch((err: unknown) => {
+  // Startup failures not handled inside main() (WebGPU-unsupported and GPU OOM
+  // are) — surface them rather than leaving an unhandled rejection.
+  console.error('[lazstream] startup failed', err)
+  statusEl.textContent = `Error: ${err instanceof Error ? err.message : String(err)}`
+  statusEl.className = 'status status--error'
+})
