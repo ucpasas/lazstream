@@ -5,7 +5,7 @@ Browser-native LAZ point cloud streaming. Load any LAZ 1.2–1.4 file directly f
 [Live demo](https://lazstream.stream) · [npm: @lazstream/core](https://www.npmjs.com/package/@lazstream/core) · [npm: @lazstream/viewer](https://www.npmjs.com/package/@lazstream/viewer)
 
 ![lazstream — garden scan, 118M points](docs/screenshot.png)
-*[Cloud Garden](https://xyz.cct.lsu.edu/cloud-garden/) — LSU Center for Computation & Technology*
+*[Cloud Garden](https://xyz.cct.lsu.edu/cloud-garden/) by Brendan Harmon, LSU Center for Computation & Technology — CC0, [doi:10.5281/zenodo.15670829](https://doi.org/10.5281/zenodo.15670829). The viewer's default sample is a copy converted to LAZ 1.4 (PDRF 7) and Morton-sorted.*
 
 ---
 

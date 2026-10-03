@@ -1,3 +1,13 @@
+## 1.5.1 — 2026-10-03
+
+### Changed
+- The viewer now opens with a default sample: the Cloud Garden terrestrial scan
+  (118.9M points, LAZ 1.4 PDRF 7, Morton-sorted, 441 MB) hosted at
+  `data.lazstream.stream`. It is pre-filled in the URL box and loads when Load
+  is pressed with the box empty.
+- Attribution for the sample is shown bottom-right: Brendan Harmon, LSU Center
+  for Computation & Technology, CC0, doi:10.5281/zenodo.15670829.
+
 ## 1.5.0 — 2026-09-30
 
 ### Fixed
