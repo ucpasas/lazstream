@@ -58,7 +58,10 @@ import type { ColorMode, GpuFault } from './render/webgpu-renderer.js'
 // in WorkerPool so the viewer never relies on the fallback path.
 import decodeWorkerUrl from '../../core/src/workers/decode-worker.ts?worker&url'
 
-const DEFAULT_URL = ''
+// Sample scan: Cloud Garden (CC0), converted to LAZ 1.4 PDRF 7 and Morton-sorted.
+const DEFAULT_URL = 'https://data.lazstream.stream/laz/terrestrial/cloud-garden-1.4-morton.laz'
+const DEFAULT_ATTRIBUTION =
+  'Cloud Garden by Brendan Harmon, LSU Center for Computation & Technology (CC0) · doi:10.5281/zenodo.15670829 · converted to LAZ 1.4'
 
 // ─── UI Elements ─────────────────────────────────────────────────────────────
 
@@ -513,8 +516,9 @@ async function main(): Promise<void> {
     }
 
     // Show manifest-level metadata
-    if (manifest.attribution) {
-      attributionEl.textContent = manifest.attribution
+    const attribution = manifest.attribution ?? (rawInput.trim() === DEFAULT_URL ? DEFAULT_ATTRIBUTION : undefined)
+    if (attribution) {
+      attributionEl.textContent = attribution
       attributionEl.style.display = 'block'
     }
 
