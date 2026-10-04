@@ -892,6 +892,19 @@ export class WebGPURenderer {
   }
 
   /**
+   * Chunk indices that currently hold a full slot in the ring buffer
+   * (excludes the seed pseudo-chunk). Read-only — used by the viewer to
+   * request field upgrades for resident chunks.
+   */
+  getResidentChunkIndices(): number[] {
+    const out: number[] = []
+    for (const slot of this.slots.getSlots()) {
+      if (slot.chunkIndex !== SEED_PSEUDO_CHUNK_INDEX) out.push(slot.chunkIndex)
+    }
+    return out
+  }
+
+  /**
    * Ring buffer state for engine back-pressure (Phase 3 Track A — Step 6).
    *
    * `slotsFree` here means "slots `allocate()` could fulfill right now" —

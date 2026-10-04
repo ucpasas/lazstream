@@ -25,6 +25,7 @@ import type { LasHeader, LazVlr, ChunkTableEntry, SeedPoint } from '../types/las
 import { fetchRange } from '../network/range-fetcher.js'
 import { ArithmeticDecoder } from '../decode/arithmetic-decoder.js'
 import { IntegerDecompressor } from '../decode/integer-decompressor.js'
+import { layerPrefixLength, parseLayerTable, validateLayerTable, type LayerTable } from '../decode/layer-select.js'
 
 export class ChunkTableError extends Error {
   constructor(message: string) {
@@ -248,12 +249,16 @@ export async function fetchChunkTable(
 /**
  * Extract the uncompressed seed point (first point) from each chunk.
  *
- * PDRF 0–5 (chunked compressor 2):  seed starts at chunkOffset + 0
- * PDRF 6–10 variable chunk (chunkSize === 0):  starts at chunkOffset + 4 (4-byte count prefix)
- * PDRF 6–10 fixed chunk (layered compressor 3): reads arithmetic-coder init bytes at offset 0.
- *   These bytes happen to produce world-X ≈ offsetX for most chunks (range-coder initialises
- *   with 0xFFFFFFFF → rawX = -1 → world_X ≈ offsetX). Seeds are sparse but give a visible
- *   overview outline. Invalid seeds are discarded by the bounds check.
+ * Fixed-size chunks (any compressor): the raw first point starts at chunkOffset + 0.
+ *   Verified against laz-perf on PDRF 3, 6 and 8 fixtures: these bytes equal decoded point 0.
+ * Variable-size chunks (chunkSize === 0): starts at chunkOffset + 4 (4-byte count prefix).
+ * Out-of-bounds seeds are discarded by the bounds check.
+ *
+ * Layer tables: for layered (compressor 3) files with fixed-size chunks, pass
+ * `options.layerTables` and the same per-chunk request is widened from reclen
+ * to reclen + 4 + 4L bytes, returning each chunk's layer table with no extra
+ * round trip. `layerTables[i]` is null when chunk i's request failed, came
+ * back short, or its table doesn't reproduce the chunk table entry.
  */
 export async function fetchSeedPoints(
   url: string,
@@ -262,14 +267,21 @@ export async function fetchSeedPoints(
   lazVlr: LazVlr,
   onProgress?: (loaded: number, total: number) => void,
   signal?: AbortSignal,
-): Promise<SeedPoint[]> {
+  options: { layerTables?: { layerCount: number } } = {},
+): Promise<{ seeds: SeedPoint[]; layerTables: Array<LayerTable | null> }> {
   const seeds: SeedPoint[] = []
+  const layerTables = new Array<LayerTable | null>(chunks.length).fill(null)
   const isPdrf6Plus = header.pointDataRecordFormat >= 6
 
   // Fixed-size chunks: seed point starts at chunk offset + 0
   // Variable-size chunks: seed point starts at chunk offset + 4 (preceded by point count)
   const seedByteOffset = (lazVlr.chunkSize === 0) ? 4 : 0
-  const seedByteLength = header.pointDataRecordLength
+  const recordLength = header.pointDataRecordLength
+  const layerCount =
+    options.layerTables && lazVlr.isLayered && lazVlr.chunkSize !== 0 && isPdrf6Plus
+      ? options.layerTables.layerCount
+      : 0
+  const seedByteLength = layerCount > 0 ? layerPrefixLength(recordLength, layerCount) : recordLength
   const BATCH_SIZE = 100
 
   console.debug('[lazstream] fetching seed points:', {
@@ -277,10 +289,11 @@ export async function fetchSeedPoints(
     isPdrf6Plus,
     seedByteOffset,
     seedByteLength,
+    layerTables: layerCount > 0,
   })
 
   for (let batchStart = 0; batchStart < chunks.length; batchStart += BATCH_SIZE) {
-    if (signal?.aborted) return seeds
+    if (signal?.aborted) return { seeds, layerTables }
 
     const batchEnd = Math.min(batchStart + BATCH_SIZE, chunks.length)
     const batchChunks = chunks.slice(batchStart, batchEnd)
@@ -315,6 +328,15 @@ export async function fetchSeedPoints(
       const chunkIndex = batchStart + i
       if (buf === null) continue
       const view = new DataView(buf)
+
+      // Layer table is independent of the seed bounds check below — a chunk
+      // whose first point lies outside the header bbox is still decodable.
+      if (layerCount > 0 && buf.byteLength >= seedByteLength) {
+        const table = parseLayerTable(buf, recordLength, layerCount)
+        if (validateLayerTable(table, chunks[chunkIndex], recordLength)) {
+          layerTables[chunkIndex] = table
+        }
+      }
 
       if (buf.byteLength < 12) {
         console.warn(
@@ -366,5 +388,10 @@ export async function fetchSeedPoints(
     console.debug(`[lazstream] ${seeds.length} / ${chunks.length} seed points extracted`)
   }
 
-  return seeds
+  if (layerCount > 0) {
+    const valid = layerTables.reduce((n, t) => n + (t ? 1 : 0), 0)
+    console.debug(`[lazstream] ${valid} / ${chunks.length} layer tables valid`)
+  }
+
+  return { seeds, layerTables }
 }

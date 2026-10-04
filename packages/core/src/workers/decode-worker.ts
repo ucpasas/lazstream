@@ -15,6 +15,15 @@
  *   decode { compressedBytes, ... }       → WASM decode → send { type: 'decoded' }
  */
 
+// Imported only here (and by tests) so Rollup inlines it into this entry —
+// point-fields.ts has no imports of its own. Verify after build that
+// dist/decode-worker.js contains no import statements.
+import {
+  allocSurfacedAttributes,
+  readSurfacedPoint,
+  surfacedTransferList,
+} from './point-fields.js'
+
 // Inlined from ../decode/color.ts — keeps decode-worker.js self-contained in
 // the npm dist (no sibling chunk import that breaks module worker loading).
 function elevationToRgb(t: number): [number, number, number] {
@@ -226,6 +235,7 @@ function decodeChunk(req: {
   globalMaxZ: number
   seedLo: number  // uint16 p1 of seed intensities (0 if no seed range)
   seedHi: number  // uint16 p99 of seed intensities (65535 if no seed range)
+  surfaceBits?: number  // field bits to surface as typed arrays (0/absent = none)
 }): void {
   try {
     if (!Module || !decoder) {
@@ -268,6 +278,13 @@ function decodeChunk(req: {
     const rawIntensity   = new Uint16Array(req.pointCount)
     const rawClassify    = new Uint8Array(req.pointCount)
 
+    // Optional attribute surfacing. null when surfaceBits is 0 — the message
+    // below is then byte-identical to the pre-surfacing worker.
+    const attributes = allocSurfacedAttributes(
+      req.surfaceBits ?? 0, pdrf, req.pointDataRecordLength, req.pointCount,
+    )
+    let heapView = attributes ? new DataView(Module.HEAPU8.buffer) : null
+
     let minX = Infinity,  minY = Infinity,  minZ = Infinity
     let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity
 
@@ -305,6 +322,12 @@ function decodeChunk(req: {
         rawR![i] = Module.HEAPU16[(pointPtr + rgbByteOffset    ) >> 1] >> 8
         rawG![i] = Module.HEAPU16[(pointPtr + rgbByteOffset + 2) >> 1] >> 8
         rawB![i] = Module.HEAPU16[(pointPtr + rgbByteOffset + 4) >> 1] >> 8
+      }
+
+      if (attributes) {
+        // Heap may have been replaced by WASM memory growth.
+        if (heapView!.buffer !== Module.HEAPU8.buffer) heapView = new DataView(Module.HEAPU8.buffer)
+        readSurfacedPoint(heapView!, pointPtr, i, pdrf, attributes)
       }
     }
 
@@ -346,18 +369,21 @@ function decodeChunk(req: {
     const decodeMs = performance.now() - t0
 
     // Transfer decoded buffers to main thread — zero-copy
-    ;(self as unknown as Worker).postMessage(
-      {
-        type: 'decoded',
-        chunkIndex: req.chunkIndex,
-        positions, colors, classification, intensity8,
-        pointCount: req.pointCount,
-        minX, minY, minZ,
-        maxX, maxY, maxZ,
-        decodeMs,
-      },
-      [positions.buffer, colors.buffer, classification.buffer, intensity8.buffer]
-    )
+    const transfer: ArrayBuffer[] = [positions.buffer, colors.buffer, classification.buffer, intensity8.buffer]
+    const message: Record<string, unknown> = {
+      type: 'decoded',
+      chunkIndex: req.chunkIndex,
+      positions, colors, classification, intensity8,
+      pointCount: req.pointCount,
+      minX, minY, minZ,
+      maxX, maxY, maxZ,
+      decodeMs,
+    }
+    if (attributes) {
+      message.attributes = attributes
+      transfer.push(...surfacedTransferList(attributes))
+    }
+    ;(self as unknown as Worker).postMessage(message, transfer)
 
   } catch (err) {
     self.postMessage({

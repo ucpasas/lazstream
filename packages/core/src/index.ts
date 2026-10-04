@@ -28,7 +28,11 @@ export type { LazstreamAssetUrls } from './decode/worker-pool.js'
 // ── Data types — what flows out of the engine ────────────────────────────────
 export type { LasHeader, LazVlr, SeedPoint, ChunkTableEntry, PointDataRecordFormat, LazVersion, PointAttributes } from './types/las.js'
 export type { BBox3D } from './types/spatial.js'
-export type { DecodedChunk } from './decode/worker-pool.js'
+export type { DecodedChunk, ChunkAttributes } from './decode/worker-pool.js'
+
+// ── Field masks — selective layer fetch + attribute surfacing ────────────────
+export { FIELDS_ALL, FIELDS_RENDER, fieldsInFormat } from './decode/fields.js'
+export type { LasField, FieldDemand } from './decode/fields.js'
 
 // ── URL validation (for custom manifest fetching pipelines) ──────────────────
 export { validateSourceUrl, validateManifestUrl, getEntryFromParams } from './network/url-validator.js'
