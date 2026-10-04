@@ -38,6 +38,10 @@
  *                      (default 0.8)
  *   ?simOOM=N          dev: simulate GPU out-of-memory for buffers > N MB
  *                      (exercises the ring-buffer backoff / fault notices)
+ *   ?fields=<mask>     base field mask: all (default) | render — layer-selective
+ *                      fetch A/B on LAZ 1.4 layered files. When present, also
+ *                      exposes window.lazstreamFields for dev-console demands
+ *                      (demandFields / upgradeResidentChunks / onChunkDecoded)
  *
  * URL fragment:
  *   #v=<base64url>     encoded ViewState (source + camera + colorMode) — takes priority
@@ -49,7 +53,7 @@
  */
 
 import { ManifestSession, fetchManifest, urlToManifest, validateManifestUrl, getEntryFromParams, encodeViewState, decodeViewState, CorsError } from '@lazstream/core'
-import type { ManifestSessionOptions, Manifest, CameraState, ChunkOrdering } from '@lazstream/core'
+import type { ManifestSessionOptions, Manifest, CameraState, ChunkOrdering, DecodedChunk, LasField } from '@lazstream/core'
 import type { CameraBench } from './dev/camera-bench.js'
 import { WebGPURenderer, WebGPUUnsupportedError, GpuOutOfMemoryError } from './render/webgpu-renderer.js'
 import type { ColorMode, GpuFault } from './render/webgpu-renderer.js'
@@ -134,6 +138,15 @@ async function main(): Promise<void> {
   // gate cuts post-settle wasted fetch from ~81-100% to ~8-19% and breaks the
   // perpetual decode→evict→re-queue churn at ground-level views.
   const exactCull = urlParams.get('exactCull') !== '0'
+
+  // ?fields=render|all — demo only; library code never reads the URL.
+  const fieldsParam = urlParams.get('fields')
+  const fetchFields =
+    fieldsParam === 'render' || fieldsParam === 'all' ? fieldsParam : undefined
+  if (fieldsParam !== null && !fetchFields) {
+    console.warn(`[lazstream] unknown ?fields=${fieldsParam} — using default 'all'`)
+  }
+  let fieldsDebugListener: ((chunk: DecodedChunk) => void) | null = null
 
   // ─── GPU OOM simulator (dev-only, loaded only when ?simOOM present) ───────
 
@@ -441,6 +454,10 @@ async function main(): Promise<void> {
         },
 
         onChunkDecoded(chunk) {
+          fieldsDebugListener?.(chunk)
+          // Upgrades (P3 field top-ups) carry new attributes only — the
+          // geometry is already resident, so the renderer must not re-add it.
+          if (chunk.isUpgrade) return
           renderer.addDecodedChunk(chunk)
           decodeTimingListener?.(chunk)
           cameraBench?.notifyChunkDecoded(chunk)
@@ -454,6 +471,7 @@ async function main(): Promise<void> {
       sseThreshold,
       maxFetches,
       chunkOrdering,
+      fetchFields,
       assetUrls: {
         workerUrl:      decodeWorkerUrl,
         lazPerfJsUrl:   new URL('/lib/laz-perf-worker.js',   location.href).href,
@@ -484,6 +502,19 @@ async function main(): Promise<void> {
 
     activeSession = session
     return session
+  }
+
+  // Dev-console handle for the field-demand API (only with ?fields=).
+  // Demands are per session: re-issue them after loading another file.
+  if (fieldsParam !== null) {
+    (window as unknown as Record<string, unknown>).lazstreamFields = {
+      demandFields: (fields: LasField[], opts?: { surface?: boolean }) =>
+        activeSession?.demandFields(fields, opts),
+      getFieldMask: () => activeSession?.getFieldMask(),
+      upgradeResidentChunks: () =>
+        activeSession?.upgradeChunks(renderer.getResidentChunkIndices()),
+      set onChunkDecoded(cb: ((chunk: DecodedChunk) => void) | null) { fieldsDebugListener = cb },
+    }
   }
 
   // ─── Load ─────────────────────────────────────────────────────────────────

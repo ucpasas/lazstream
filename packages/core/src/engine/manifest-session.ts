@@ -28,6 +28,7 @@ import type { LasHeader, SeedPoint, PointAttributes } from '../types/las.js'
 import type { BBox3D } from '../types/spatial.js'
 import type { CameraInfo, VisibilityTest } from '../decode/chunk-priority.js'
 import type { DecodedChunk } from '../decode/worker-pool.js'
+import { FieldDemandSet, fromBits, resolveFetchFields, type FieldDemand, type LasField } from '../decode/fields.js'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -47,10 +48,72 @@ export class ManifestSession {
   private ringBufferProvider: RingBufferProvider | null = null
   private visibilityProvider: VisibilityTest | null = null
 
+  /** Session-wide view of the field mask — drives getFieldMask / onFieldsChanged. */
+  private readonly demands: FieldDemandSet
+  /** Live demands, re-applied to every engine created by load(). */
+  private liveDemands = new Set<{
+    fields: LasField[]; surface: boolean; engineHandles: FieldDemand[]
+  }>()
+
   constructor(
     private readonly manifest: Manifest,
     private readonly options: ManifestSessionOptions,
-  ) {}
+  ) {
+    this.demands = new FieldDemandSet(
+      resolveFetchFields(options.fetchFields),
+      (fetchBits, surfaceBits) => options.events.onFieldsChanged?.(fromBits(fetchBits), fromBits(surfaceBits)),
+    )
+  }
+
+  /**
+   * Demand fields across every tile engine (see StreamingEngine.demandFields).
+   * Safe to call before load(): the demand is applied to engines as they are
+   * created. Returns one composite, idempotent handle.
+   */
+  demandFields(fields: Iterable<LasField>, opts: { surface?: boolean } = {}): FieldDemand {
+    const list = [...fields]
+    const surface = opts.surface ?? false
+    const sessionHandle = this.demands.add(list, surface)
+    const record = {
+      fields: list,
+      surface,
+      engineHandles: this.engines.map(e => e.demandFields(list, { surface })),
+    }
+    this.liveDemands.add(record)
+    let released = false
+    return {
+      fields: sessionHandle.fields,
+      release: () => {
+        if (released) return
+        released = true
+        this.liveDemands.delete(record)
+        for (const h of record.engineHandles) h.release()
+        sessionHandle.release()
+      },
+    }
+  }
+
+  /** Effective fetch mask: base ∪ live demands ∪ {xyz}. */
+  getFieldMask(): ReadonlySet<LasField> {
+    return fromBits(this.demands.fetchBits())
+  }
+
+  /**
+   * Bring already-decoded chunks (GLOBAL indices) up to the current mask —
+   * see StreamingEngine.upgradeChunks. Upgraded chunks re-emit through
+   * onChunkDecoded with isUpgrade: true.
+   */
+  upgradeChunks(chunkIndices: number[]): void {
+    const perEngine = new Map<StreamingEngine, number[]>()
+    for (const g of chunkIndices) {
+      const { engine, localIndex } = this.resolveGlobalIndex(g)
+      if (!engine) continue
+      let list = perEngine.get(engine)
+      if (!list) perEngine.set(engine, list = [])
+      list.push(localIndex)
+    }
+    for (const [engine, locals] of perEngine) engine.upgradeChunks(locals)
+  }
 
   /** Register camera position provider — forwarded to all tile engines. */
   setCameraProvider(provider: () => CameraInfo): void {
@@ -123,7 +186,10 @@ export class ManifestSession {
    */
   async load(): Promise<void> {
     const { tiles } = this.manifest
-    const { events, workerCount, sseThreshold, maxFetches, cache, assetUrls, chunkOrdering } = this.options
+    const {
+      events, workerCount, sseThreshold, maxFetches, cache, assetUrls, chunkOrdering,
+      fetchFields, selectiveMaxGapBytes, topUpMemoryBytes,
+    } = this.options
     const tileCount = tiles.length
 
     // Distribute the total worker budget evenly across tiles.
@@ -200,7 +266,15 @@ export class ManifestSession {
         maxFetches,
         assetUrls,
         chunkOrdering,
+        fetchFields,
+        selectiveMaxGapBytes,
+        topUpMemoryBytes,
       })
+
+      // Demands made before (or during) load apply to every tile engine.
+      for (const d of this.liveDemands) {
+        d.engineHandles.push(engine.demandFields(d.fields, { surface: d.surface }))
+      }
 
       // Register providers that were set before load()
       if (this.cameraProvider)   engine.setCameraProvider(this.cameraProvider)
@@ -354,6 +428,8 @@ function aggregateTileStats(perTile: Array<TileStats | null>): TileStats | null 
     decodedPoints: filled.reduce((s, t) => s + (t.decodedPoints ?? 0), 0),
     activeWorkers: filled.reduce((s, t) => s + (t.activeWorkers ?? 0), 0),
     queuedChunks:  filled.reduce((s, t) => s + (t.queuedChunks ?? 0), 0),
+    bytesFetched:  filled.reduce((s, t) => s + (t.bytesFetched ?? 0), 0),
+    bytesSkipped:  filled.reduce((s, t) => s + (t.bytesSkipped ?? 0), 0),
   }
 }
 

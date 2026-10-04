@@ -261,6 +261,35 @@ const state: CameraState | null = viewer.getCameraState()
 
 ---
 
+## Field demands and attribute consumers
+
+```typescript
+const viewer = await LazstreamViewer.create(canvas, { fetchFields: 'render' })
+
+// Every decoded chunk, after the renderer took it — including upgrades.
+viewer.onChunkDecoded = (chunk) => {
+  if (!chunk.fieldsPresent?.has('gpsTime')) return   // see the fieldsPresent rule in @lazstream/core
+  const gps = chunk.attributes?.gpsTime               // copy what you keep
+}
+
+const demand = viewer.demandFields(['gpsTime'], { surface: true })  // survives load()
+viewer.upgradeResidentChunks()   // top up chunks already on the GPU (missing layers only)
+demand.release()
+```
+
+`fetchFields` (`'all'` default, `'render'`, or a field list) and
+`onFieldsChanged` are also accepted in `ViewerOptions`. Upgraded chunks
+(`chunk.isUpgrade`) are never re-added to the renderer.
+
+`'render'` fetches `xyz`, `intensity`, `classification`, `rgb`, plus `returns`
+and `flags` (nearly free to keep), and skips scan angle, user data, point
+source ID, GPS time, NIR, waveform and extra bytes. It only applies to LAZ 1.4
+layered files with fixed-size chunks; others are fetched whole. See
+[What `'render'` fetches](https://github.com/ucpasas/lazstream/tree/main/packages/core#what-render-fetches)
+in the core README.
+
+---
+
 ## Accessing the underlying session
 
 ```typescript

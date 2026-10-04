@@ -1,3 +1,18 @@
+## 1.6.0 — 2026-10-04
+
+### Added
+- `ViewerOptions.fetchFields` and `onFieldsChanged`, passed to the session
+  (`@lazstream/core` 1.5.0 field masks).
+- `viewer.onChunkDecoded` consumer hook: fires for every decoded chunk after the
+  renderer takes it, including upgrade re-emissions.
+- `viewer.demandFields(fields, { surface })` — handles stay valid across `load()`.
+- `viewer.upgradeResidentChunks()` and `WebGPURenderer.getResidentChunkIndices()`.
+- Demo: `?fields=render|all`; with it, `window.lazstreamFields` exposes
+  `demandFields` / `upgradeResidentChunks` / `onChunkDecoded` in the dev console.
+
+### Changed
+- Upgrade re-emissions (`chunk.isUpgrade`) are never re-added to the renderer.
+
 ## 1.5.1 — 2026-10-03
 
 ### Changed

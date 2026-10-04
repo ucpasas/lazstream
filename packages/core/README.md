@@ -133,6 +133,9 @@ All options are passed to `ManifestSession` as the second argument.
 | `maxFetches` | `workerCount × 4` | Max concurrent HTTP range requests. |
 | `cache` | `null` | Pass a `ChunkCache` instance to enable IndexedDB caching of compressed chunk bytes across sessions. |
 | `assetUrls` | auto | Override laz-perf WASM and worker URLs for CDN or custom hosting. |
+| `fetchFields` | `'all'` | Base field mask: `'all'` (whole chunks), `'render'` (`FIELDS_RENDER`), or a `LasField[]`. See [Field masks](#field-masks--selective-layer-fetch). |
+| `selectiveMaxGapBytes` | `8192` | Max gap bridged when coalescing layer-selective ranges. |
+| `topUpMemoryBytes` | 64 MB | In-memory budget for compact chunk bytes used as the base for `upgradeChunks()` top-ups. Only filled in selective mode; `0` disables. |
 
 ### `sseThreshold` — when chunks decode
 
@@ -179,7 +182,74 @@ Passed through to the renderer (not a session option itself). Controls how many 
 | `onProgress` | `(loaded: number, total: number, phase: string) => void` | Loading progress |
 | `onWarning` | `(msg: string) => void` | Non-fatal warnings |
 | `onError` | `(err: Error) => void` | Fatal errors |
-| `onStats` | `(stats: EngineStats) => void` | Per-tick performance metrics |
+| `onStats` | `(stats: EngineStats) => void` | Per-tick performance metrics (incl. `bytesFetched` / `bytesSkipped`) |
+| `onFieldsChanged` | `(fetch: ReadonlySet<LasField>, surface: ReadonlySet<LasField>) => void` | Effective field mask changed (demand added/released) |
+
+---
+
+## Field masks — selective layer fetch
+
+LAZ 1.4 layered files (PDRF 6–10, compressor 3, fixed-size chunks) store each
+field in its own compressed layer. lazstream can range-read only the layers a
+**field mask** needs — still raw LAZ, still decoded by the stock laz-perf build.
+Every other file (LAZ 1.2/1.3, variable-size chunks) is always fetched whole.
+
+```typescript
+import { ManifestSession, FIELDS_RENDER } from '@lazstream/core'
+
+// Fetch only what the renderer reads: xyz, intensity, returns, flags, class, rgb
+const session = new ManifestSession(manifest, { events, fetchFields: 'render' })
+
+// Later: an add-on needs GPS time as a typed array. Anonymous, ref-counted.
+const demand = session.demandFields(['gpsTime'], { surface: true })
+
+// Chunks fetched from now on carry chunk.attributes.gpsTime. Chunks already
+// decoded are unchanged — top them up (fetches only the missing layers):
+session.upgradeChunks(residentGlobalChunkIndices)
+
+demand.release()   // future fetches shrink back; decoded chunks are not downgraded
+```
+
+`LasField` names follow the LAS spec: `xyz`, `intensity`, `returns`, `flags`,
+`classification`, `scanAngle`, `userData`, `pointSourceId`, `gpsTime`, `rgb`,
+`nir`, `wavepacket` (fetch-only, never surfaced), `extraBytes`. `xyz` is always
+included. `fieldsInFormat(pdrf, recordLength)` lists what a point format carries.
+
+### What `'render'` fetches
+
+`'render'` (`FIELDS_RENDER`) fetches six fields:
+
+| Field | Why it's included |
+|---|---|
+| `xyz` | Always fetched; positions can't be skipped |
+| `intensity` | Intensity colour mode |
+| `classification` | Classification colour mode |
+| `rgb` | RGB colour mode (PDRF 7, 8 and 10 only) |
+| `returns` | Almost free: stored in the XY layer, which is always fetched |
+| `flags` | Small; its layer sits between classification and intensity, so keeping it avoids a gap in the byte range |
+
+It **skips** scan angle, user data, point source ID, GPS time, NIR, waveform
+and extra bytes. In layer terms it keeps layers 0–4 (xy, z, classification,
+flags, intensity) as one byte range from the start of each chunk, plus the RGB
+layer as a second range. A chunk is fetched whole when fewer than 2 KB would be
+skipped.
+
+"Fetch" is not "surface": a mask controls which bytes are downloaded. No
+`attributes` arrays are produced unless something calls
+`demandFields(..., { surface: true })` — the stock renderer reads only
+positions, colours, classification and the stretched intensity. The saving
+depends on the file: if the skipped layers are empty (e.g. a file whose GPS
+time and scan angle were never populated), `'render'` saves nothing.
+
+> **Correctness rule.** A `DecodedChunk` field is valid **only if** it is in
+> `chunk.fieldsPresent`. A skipped layer decodes as a *plausible constant*
+> (the chunk's first-point value), not as an error. Chunks decoded under
+> different masks coexist in one session; a consumer that needs a field must
+> check each chunk and request an upgrade for the ones that lack it.
+
+Upgraded chunks re-emit through `onChunkDecoded` with `isUpgrade: true`.
+Renderers should ignore them (geometry is already resident); attribute
+consumers should take them. Upgrades run behind visible-chunk dispatch.
 
 ---
 
@@ -313,6 +383,23 @@ interface DecodedChunk {
   minX: number; minY: number; minZ: number  // tight world-space bounding box
   maxX: number; maxY: number; maxZ: number
   decodeMs:   number      // decode wall-clock time in milliseconds
+  fieldsPresent?: ReadonlySet<LasField>  // fields with valid data — see Field masks
+  attributes?: ChunkAttributes           // fields demanded with surface: true
+  isUpgrade?: boolean                    // upgradeChunks() re-emission
+}
+
+interface ChunkAttributes {
+  intensityRaw?: Uint16Array             // unstretched (intensity8 is the stretched copy)
+  returnNumber?: Uint8Array
+  numberOfReturns?: Uint8Array
+  flags?: Uint8Array                     // b0 synthetic, b1 key-point, b2 withheld,
+  flagsLayout?: 'legacy' | 'extended'    // b6 scan dir, b7 edge; extended adds b3 overlap, b4–5 channel
+  scanAngle?: Float32Array               // degrees, normalised across PDRF families
+  userData?: Uint8Array
+  pointSourceId?: Uint16Array
+  gpsTime?: Float64Array
+  nir?: Uint16Array
+  extraBytes?: { stride: number; data: Uint8Array }
 }
 ```
 

@@ -24,6 +24,7 @@
  */
 
 import type { LasHeader, LazVlr, ChunkTableEntry, PointAttributes } from '../types/las.js'
+import { fromBits, type LasField } from './fields.js'
 
 /**
  * Override URLs for lazstream's bundled worker and WASM assets.
@@ -43,6 +44,35 @@ export interface LazstreamAssetUrls {
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
+/**
+ * Raw LAS attributes surfaced on demand (see StreamingEngine.demandFields with
+ * `surface: true`). Each array has one entry per point, in decode order.
+ * Only fields that were both demanded for surfacing AND present in the bytes
+ * the chunk was decoded from appear here.
+ */
+export interface ChunkAttributes {
+  /** Raw uint16 intensity (intensity8 stays the seed-stretched copy). */
+  intensityRaw?: Uint16Array
+  returnNumber?: Uint8Array
+  numberOfReturns?: Uint8Array
+  /**
+   * Raw flag bits; layout per flagsLayout. Bits 0–2 and 6–7 mean the same in
+   * both layouts: b0 synthetic, b1 key-point, b2 withheld, b6 scan direction,
+   * b7 edge of flight line. 'extended' (PDRF 6–10) adds b3 overlap and
+   * b4–5 scanner channel; in 'legacy' (PDRF 0–5) those bits are 0.
+   */
+  flags?: Uint8Array
+  flagsLayout?: 'legacy' | 'extended'
+  /** Degrees, normalised across families (PDRF 6–10 int16 × 0.006; PDRF 0–5 int8 rank). */
+  scanAngle?: Float32Array
+  userData?: Uint8Array
+  pointSourceId?: Uint16Array
+  gpsTime?: Float64Array
+  nir?: Uint16Array
+  /** Per-point extra bytes, `stride` bytes each, packed. */
+  extraBytes?: { stride: number; data: Uint8Array }
+}
+
 export interface DecodedChunk {
   chunkIndex: number
   positions: Int16Array
@@ -55,6 +85,29 @@ export interface DecodedChunk {
   minX: number; minY: number; minZ: number
   maxX: number; maxY: number; maxZ: number
   decodeMs: number
+  /**
+   * Fields with VALID data in this chunk. A field outside this set decoded
+   * as a plausible constant (its compressed layer was not fetched) — never
+   * read it. Chunks decoded under different masks coexist in one session.
+   * Absent only for chunks from a pool driven without an engine.
+   */
+  fieldsPresent?: ReadonlySet<LasField>
+  /** Raw attributes demanded with `surface: true` (subset of fieldsPresent). */
+  attributes?: ChunkAttributes
+  /** True for an upgradeChunks() re-emission of a chunk already emitted.
+   *  Renderers should ignore these; attribute consumers should take them. */
+  isUpgrade?: boolean
+}
+
+/** Per-request decode options. */
+export interface DecodeRequestOptions {
+  /** Field bits to surface into DecodedChunk.attributes. Default 0 (none). */
+  surfaceBits?: number
+  /** Field bits actually valid in these bytes → DecodedChunk.fieldsPresent. */
+  presentBits?: number
+  /** Re-decode of an already-decoded chunk (P3 upgrade). Bypasses the
+   *  completed-set dedup and queues behind all normal decodes. */
+  upgrade?: boolean
 }
 
 export interface WorkerPoolEvents {
@@ -67,6 +120,7 @@ interface PendingRequest {
   chunkIndex: number
   chunk: ChunkTableEntry
   compressedBytes: ArrayBuffer    // Held until a worker is free; transferred on dispatch
+  opts: DecodeRequestOptions
 }
 
 interface PendingAttrRequest {
@@ -82,6 +136,7 @@ interface WorkerState {
   busy: boolean
   currentChunkIndex: number | null
   currentAttrSeqId: number | null  // non-null when busy with a decode-attrs request
+  currentOpts: DecodeRequestOptions | null  // options of the in-flight chunk decode
 }
 
 // ─── Worker Pool ─────────────────────────────────────────────────────────────
@@ -100,6 +155,11 @@ export class WorkerPool {
 
   private inFlight = new Set<number>()
   private completed = new Set<number>()
+
+  /** P3 upgrade re-decodes: separate from queue/inFlight so they never count
+   *  as ring-buffer-bound work and always run after normal decodes. */
+  private upgradeQueue: PendingRequest[] = []
+  private upgradeInFlight = new Set<number>()
 
   private pendingAttrs = new Map<number, { resolve: (v: PointAttributes) => void; reject: (e: Error) => void }>()
   private attrQueue: PendingAttrRequest[] = []
@@ -148,6 +208,7 @@ export class WorkerPool {
           busy: false,
           currentChunkIndex: null,
           currentAttrSeqId: null,
+          currentOpts: null,
         }
 
         // Set up handler BEFORE posting init message
@@ -206,11 +267,13 @@ export class WorkerPool {
             }
             state.currentAttrSeqId = null
           } else if (state.currentChunkIndex !== null) {
-            this.inFlight.delete(state.currentChunkIndex)
+            if (state.currentOpts?.upgrade) this.upgradeInFlight.delete(state.currentChunkIndex)
+            else this.inFlight.delete(state.currentChunkIndex)
             this.events.onWorkerError?.(state.currentChunkIndex, err.message ?? 'uncaught worker error')
           }
           state.busy = false
           state.currentChunkIndex = null
+          state.currentOpts = null
         }
 
         this.workers.push(state)
@@ -253,23 +316,38 @@ export class WorkerPool {
    * flight (we don't re-queue). The engine's startFetch should already
    * have filtered these via isKnown() before fetching, so this is a
    * defensive net.
+   *
+   * `opts.upgrade` re-decodes an already-completed chunk (P3): it skips the
+   * completed check, but still no-ops if the chunk is pending anywhere.
+   *
+   * Returns false when the request was dropped by dedup (bytes discarded).
    */
   requestDecode(
     chunkIndex: number,
     chunk: ChunkTableEntry,
     compressedBytes: ArrayBuffer,
-  ): void {
-    if (this.disposed) return
-    if (this.completed.has(chunkIndex) || this.inFlight.has(chunkIndex)) return
+    opts: DecodeRequestOptions = {},
+  ): boolean {
+    if (this.disposed) return false
+
+    if (opts.upgrade) {
+      if (this.isPending(chunkIndex)) return false
+      const idle = this.queue.length === 0 ? this.workers.find(w => !w.busy) : undefined
+      if (idle) this.dispatch(idle, chunkIndex, chunk, compressedBytes, opts)
+      else this.upgradeQueue.push({ chunkIndex, chunk, compressedBytes, opts })
+      return true
+    }
+
+    if (this.completed.has(chunkIndex) || this.inFlight.has(chunkIndex)) return false
 
     const idle = this.workers.find(w => !w.busy)
     if (idle) {
-      this.dispatch(idle, chunkIndex, chunk, compressedBytes)
+      this.dispatch(idle, chunkIndex, chunk, compressedBytes, opts)
     } else {
-      if (!this.queue.some(q => q.chunkIndex === chunkIndex)) {
-        this.queue.push({ chunkIndex, chunk, compressedBytes })
-      }
+      if (this.queue.some(q => q.chunkIndex === chunkIndex)) return false
+      this.queue.push({ chunkIndex, chunk, compressedBytes, opts })
     }
+    return true
   }
 
   /**
@@ -279,8 +357,14 @@ export class WorkerPool {
    */
   isKnown(chunkIndex: number): boolean {
     if (this.completed.has(chunkIndex)) return true
-    if (this.inFlight.has(chunkIndex)) return true
+    return this.isPending(chunkIndex)
+  }
+
+  /** True if a decode (normal or upgrade) for this chunk is queued or running. */
+  isPending(chunkIndex: number): boolean {
+    if (this.inFlight.has(chunkIndex) || this.upgradeInFlight.has(chunkIndex)) return true
     return this.queue.some(q => q.chunkIndex === chunkIndex)
+      || this.upgradeQueue.some(q => q.chunkIndex === chunkIndex)
   }
 
   /** Remove a chunk from the completed set so it can be re-decoded after
@@ -318,7 +402,9 @@ export class WorkerPool {
     this.disposed = true
     this.queue = []
     this.attrQueue = []
+    this.upgradeQueue = []
     this.inFlight.clear()
+    this.upgradeInFlight.clear()
     for (const { reject } of this.pendingAttrs.values()) {
       reject(new Error('WorkerPool disposed'))
     }
@@ -334,6 +420,7 @@ export class WorkerPool {
     chunkIndex: number,
     chunk: ChunkTableEntry,
     compressedBytes: ArrayBuffer,
+    opts: DecodeRequestOptions,
   ): void {
     if (!this.header || !this.lazVlr) {
       console.error('[lazstream] dispatch called before configure() — skipping')
@@ -342,7 +429,9 @@ export class WorkerPool {
 
     workerState.busy = true
     workerState.currentChunkIndex = chunkIndex
-    this.inFlight.add(chunkIndex)
+    workerState.currentOpts = opts
+    if (opts.upgrade) this.upgradeInFlight.add(chunkIndex)
+    else this.inFlight.add(chunkIndex)
 
     // Transfer the compressed bytes (not copy) — after postMessage the
     // ArrayBuffer is detached on this side. Track A Step 3 fetch model.
@@ -363,17 +452,21 @@ export class WorkerPool {
       globalMaxZ: this.header.maxZ,
       seedLo: this.intensitySeedRange?.lo ?? 0,
       seedHi: this.intensitySeedRange?.hi ?? 65535,
+      surfaceBits: opts.surfaceBits ?? 0,
     }, [compressedBytes])
   }
 
   private handleDecoded(workerState: WorkerState, msg: any): void {
     const chunkIndex = msg.chunkIndex as number
+    const opts = workerState.currentOpts ?? {}
     workerState.busy = false
     workerState.currentChunkIndex = null
-    this.inFlight.delete(chunkIndex)
+    workerState.currentOpts = null
+    if (opts.upgrade) this.upgradeInFlight.delete(chunkIndex)
+    else this.inFlight.delete(chunkIndex)
     this.completed.add(chunkIndex)
 
-    this.events.onChunkDecoded?.({
+    const decoded: DecodedChunk = {
       chunkIndex,
       positions: msg.positions,
       colors: msg.colors,
@@ -383,16 +476,22 @@ export class WorkerPool {
       minX: msg.minX, minY: msg.minY, minZ: msg.minZ,
       maxX: msg.maxX, maxY: msg.maxY, maxZ: msg.maxZ,
       decodeMs: msg.decodeMs ?? 0,
-    })
+    }
+    if (opts.presentBits !== undefined) decoded.fieldsPresent = fromBits(opts.presentBits)
+    if (msg.attributes) decoded.attributes = msg.attributes as ChunkAttributes
+    if (opts.upgrade) decoded.isUpgrade = true
+    this.events.onChunkDecoded?.(decoded)
 
     this.dispatchNext(workerState)
   }
 
   private handleError(workerState: WorkerState, msg: any): void {
     const chunkIndex = msg.chunkIndex as number
+    if (workerState.currentOpts?.upgrade) this.upgradeInFlight.delete(chunkIndex)
+    else this.inFlight.delete(chunkIndex)
     workerState.busy = false
     workerState.currentChunkIndex = null
-    this.inFlight.delete(chunkIndex)
+    workerState.currentOpts = null
 
     console.warn(`[lazstream] decode error chunk ${chunkIndex}: ${msg.message}`)
     this.events.onWorkerError?.(chunkIndex, msg.message)
@@ -408,10 +507,11 @@ export class WorkerPool {
       this.dispatchAttr(workerState, next.seqId, next.compressedBytes, next.pointIndex)
       return
     }
-    if (this.queue.length === 0) return
     if (!this.header || !this.lazVlr) return
-    const next = this.queue.shift()!
-    this.dispatch(workerState, next.chunkIndex, next.chunk, next.compressedBytes)
+    // Normal decodes before upgrades — upgrades never delay visible chunks.
+    const next = this.queue.shift() ?? this.upgradeQueue.shift()
+    if (!next) return
+    this.dispatch(workerState, next.chunkIndex, next.chunk, next.compressedBytes, next.opts)
   }
 
   private dispatchAttr(
@@ -423,6 +523,7 @@ export class WorkerPool {
     if (!this.header) return
     workerState.busy = true
     workerState.currentChunkIndex = null
+    workerState.currentOpts = null
     workerState.currentAttrSeqId = seqId
 
     workerState.worker.postMessage({

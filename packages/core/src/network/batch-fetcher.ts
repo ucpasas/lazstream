@@ -32,20 +32,77 @@ export const DEFAULT_MAX_BATCH_BYTES = 4 * 1024 * 1024
  *  outweigh the saved request overhead. */
 export const DEFAULT_MAX_GAP_BYTES = 64 * 1024
 
+/** One byte range to fetch, tagged with the chunk (key) and piece (part) it belongs to. */
+export interface RangeItem {
+  key: number
+  part: number
+  /** Inclusive absolute start byte. */
+  start: number
+  /** EXCLUSIVE absolute end byte. */
+  end: number
+}
+
+export interface RangeBatch {
+  /** Inclusive start byte. */
+  start: number
+  /** EXCLUSIVE end byte. Subtract 1 for HTTP Range header. */
+  end: number
+  /** Items contained, in byte-offset order. */
+  items: RangeItem[]
+}
+
 /**
- * Coalesce adjacent chunks into Range request batches.
+ * Coalesce arbitrary byte ranges into Range request batches.
  *
- * Sorts by byte offset, then walks left-to-right merging chunks where:
- *   - Gap between current batch end and chunk start ≤ maxGapBytes
+ * Sorts by start byte, then walks left-to-right merging ranges where:
+ *   - Gap between current batch end and range start ≤ maxGapBytes
  *   - Resulting batch span ≤ maxBatchBytes
  *
  * Returns batches in byte-offset order. Caller fetches each batch with
- * one Range request, then slices per-chunk bytes from the response.
+ * one Range request, then slices each item's bytes from the response.
  *
- * Wasted bytes: any gap that gets bridged (< maxGapBytes) is fetched
- * but not used. This is intentional — the request-overhead saving
- * outweighs the bandwidth cost. The 64 KB cap keeps the worst-case
- * waste bounded.
+ * Wasted bytes: any gap that gets bridged (≤ maxGapBytes) is fetched
+ * but not used. For whole chunks the 64 KB default is the right trade;
+ * layer-selective ranges pass a much smaller gap, otherwise the skipped
+ * layers between two kept ranges get bridged and fetched anyway.
+ */
+export function coalesceRanges(
+  items: RangeItem[],
+  options: {
+    maxBatchBytes?: number
+    maxGapBytes?: number
+  } = {},
+): RangeBatch[] {
+  const maxBatchBytes = options.maxBatchBytes ?? DEFAULT_MAX_BATCH_BYTES
+  const maxGapBytes = options.maxGapBytes ?? DEFAULT_MAX_GAP_BYTES
+
+  if (items.length === 0) return []
+
+  const sorted = [...items].sort((a, b) => a.start - b.start)
+  const batches: RangeBatch[] = []
+  let current: RangeBatch | null = null
+
+  for (const item of sorted) {
+    if (
+      current !== null &&
+      item.start - current.end <= maxGapBytes &&
+      item.end - current.start <= maxBatchBytes
+    ) {
+      current.items.push(item)
+      current.end = item.end
+    } else {
+      if (current !== null) batches.push(current)
+      current = { start: item.start, end: item.end, items: [item] }
+    }
+  }
+  if (current !== null) batches.push(current)
+
+  return batches
+}
+
+/**
+ * Coalesce adjacent whole chunks into Range request batches.
+ * Thin wrapper over coalesceRanges — one item per chunk.
  */
 export function coalesce(
   chunks: Array<{ chunkIndex: number; chunk: ChunkTableEntry }>,
@@ -54,35 +111,16 @@ export function coalesce(
     maxGapBytes?: number
   } = {},
 ): FetchBatch[] {
-  const maxBatchBytes = options.maxBatchBytes ?? DEFAULT_MAX_BATCH_BYTES
-  const maxGapBytes = options.maxGapBytes ?? DEFAULT_MAX_GAP_BYTES
-
-  if (chunks.length === 0) return []
-
-  const sorted = [...chunks].sort((a, b) => a.chunk.offset - b.chunk.offset)
-  const batches: FetchBatch[] = []
-  let current: FetchBatch | null = null
-
-  for (const item of sorted) {
-    const itemEnd = item.chunk.offset + item.chunk.compressedSize
-
-    if (
-      current !== null &&
-      item.chunk.offset - current.end <= maxGapBytes &&
-      itemEnd - current.start <= maxBatchBytes
-    ) {
-      current.chunks.push(item)
-      current.end = itemEnd
-    } else {
-      if (current !== null) batches.push(current)
-      current = {
-        start: item.chunk.offset,
-        end: itemEnd,
-        chunks: [item],
-      }
-    }
-  }
-  if (current !== null) batches.push(current)
-
-  return batches
+  // key = position in `chunks`, so duplicate chunk indices survive exactly as before.
+  const items: RangeItem[] = chunks.map((c, i) => ({
+    key: i,
+    part: 0,
+    start: c.chunk.offset,
+    end: c.chunk.offset + c.chunk.compressedSize,
+  }))
+  return coalesceRanges(items, options).map(b => ({
+    start: b.start,
+    end: b.end,
+    chunks: b.items.map(i => chunks[i.key]),
+  }))
 }

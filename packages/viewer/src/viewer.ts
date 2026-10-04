@@ -19,6 +19,9 @@ import type {
   LazstreamAssetUrls,
   PointAttributes,
   CameraState,
+  DecodedChunk,
+  LasField,
+  FieldDemand,
 } from '@lazstream/core'
 import { WebGPURenderer, WebGPUUnsupportedError, GpuOutOfMemoryError } from './render/webgpu-renderer.js'
 import type { ColorMode, GpuMemoryBudget, GpuFault } from './render/webgpu-renderer.js'
@@ -101,6 +104,14 @@ export interface ViewerOptions {
   resolveAttributes?: boolean
   /** Initial colour mode. Default: 'rgb' if the file has native colour, else 'height'. */
   colorMode?: ColorMode
+  /**
+   * Base field mask for chunk fetches. 'all' (default) fetches whole chunks.
+   * 'render' fetches only what the stock renderer reads (LAZ 1.4 layered
+   * files with fixed-size chunks; others are always fetched whole). Grow it
+   * at runtime with demandFields().
+   */
+  fetchFields?: ManifestSessionOptions['fetchFields']
+  onFieldsChanged?: EngineEvents['onFieldsChanged']
   onStateChange?: EngineEvents['onStateChange']
   onProgress?: EngineEvents['onProgress']
   onWarning?: EngineEvents['onWarning']
@@ -127,6 +138,17 @@ export class LazstreamViewer {
    * that is actually active on the GPU.
    */
   onColorModeChanged: ((resolved: ColorMode) => void) | null = null
+
+  /**
+   * Fires for every decoded chunk, after the renderer has taken it — including
+   * upgrade re-emissions (`chunk.isUpgrade`), which the renderer ignores.
+   * Read only fields listed in `chunk.fieldsPresent`; copy what you keep (the
+   * renderer does not retain DecodedChunks).
+   */
+  onChunkDecoded: ((chunk: DecodedChunk) => void) | null = null
+
+  /** Live demands; re-applied to each new session so handles survive load(). */
+  private demands = new Set<{ fields: LasField[]; surface: boolean; handle: FieldDemand | null }>()
 
   private constructor(renderer: WebGPURenderer, options: ViewerOptions) {
     this.renderer = renderer
@@ -197,7 +219,7 @@ export class LazstreamViewer {
       this.activeSession = null
     }
 
-    const { workerCount, sseThreshold, maxFetches, assetUrls } = this.options
+    const { workerCount, sseThreshold, maxFetches, assetUrls, fetchFields } = this.options
 
     const sessionOptions: ManifestSessionOptions = {
       events: {
@@ -206,6 +228,7 @@ export class LazstreamViewer {
         onProgress:    this.options.onProgress,
         onStats:       this.options.onStats,
         onError:       this.options.onError,
+        onFieldsChanged: this.options.onFieldsChanged,
         onSeedsReady: (seeds, header) => {
           this.renderer.loadSeedPoints(seeds, header)
           // Apply initial colour mode from ViewerOptions if provided (consumer owns URL sync).
@@ -216,17 +239,23 @@ export class LazstreamViewer {
           this.startDecodeLoop(session)
         },
         onChunkDecoded: (chunk) => {
-          this.renderer.addDecodedChunk(chunk)
+          // Upgrades carry new attributes only — geometry is already resident.
+          if (!chunk.isUpgrade) this.renderer.addDecodedChunk(chunk)
+          this.onChunkDecoded?.(chunk)
         },
       },
       workerCount,
       sseThreshold,
       maxFetches,
       assetUrls,
+      fetchFields,
     }
 
     const session = new ManifestSession(manifest, sessionOptions)
     this.activeSession = session
+    for (const d of this.demands) {
+      d.handle = session.demandFields(d.fields, { surface: d.surface })
+    }
 
     session.setCameraProvider(() => {
       const pos = this.renderer.getCameraWorldPosition()
@@ -350,6 +379,41 @@ export class LazstreamViewer {
   applyCameraState(state: CameraState): void {
     if (!this.renderer) return
     this.renderer.applyCameraState(state)
+  }
+
+  /**
+   * Ask the engine to fetch these LAS fields (and, with `surface: true`,
+   * decode them into `DecodedChunk.attributes`) for chunks fetched from now
+   * on. The handle stays valid across load(); call `release()` when done.
+   * Already-resident chunks are unchanged — see upgradeResidentChunks().
+   */
+  demandFields(fields: Iterable<LasField>, opts: { surface?: boolean } = {}): FieldDemand {
+    const record = {
+      fields: [...fields],
+      surface: opts.surface ?? false,
+      handle: null as FieldDemand | null,
+    }
+    record.handle = this.activeSession?.demandFields(record.fields, { surface: record.surface }) ?? null
+    this.demands.add(record)
+    let released = false
+    return {
+      fields: new Set(record.fields),
+      release: () => {
+        if (released) return
+        released = true
+        this.demands.delete(record)
+        record.handle?.release()
+      },
+    }
+  }
+
+  /**
+   * Bring every chunk currently resident on the GPU up to the current field
+   * demands. Only missing compressed layers are fetched where possible;
+   * upgraded chunks arrive via onChunkDecoded with `isUpgrade: true`.
+   */
+  upgradeResidentChunks(): void {
+    this.activeSession?.upgradeChunks(this.renderer.getResidentChunkIndices())
   }
 
   /** Stop all streaming and release all GPU + worker resources. */

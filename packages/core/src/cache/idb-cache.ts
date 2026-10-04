@@ -82,6 +82,13 @@ export class ChunkCache {
     )
   }
 
+  /** True if the in-memory index lists `key`. Does not touch hit/miss
+   *  counters or LRU order — used to probe alternative keys cheaply. */
+  async has(key: string): Promise<boolean> {
+    if (!this.initialised) await this.init()
+    return this.index.has(key)
+  }
+
   /** Returns cached compressed bytes or null on miss. */
   async get(key: string): Promise<ArrayBuffer | null> {
     if (!this.initialised) await this.init()
@@ -226,7 +233,7 @@ export class ChunkCache {
 }
 
 /**
- * Build a cache key from (url, chunkIndex, byteOffset).
+ * Build a cache key from (url, chunkIndex, byteOffset[, variant]).
  *
  * Three-part key:
  *   - FNV-1a hash of URL — distinguishes files; short string output
@@ -234,9 +241,15 @@ export class ChunkCache {
  *   - byteOffset — invalidates on file rewrite (re-uploaded LAZ has
  *     different offsets, so old cache entries become unreachable
  *     rather than serving stale data)
+ *
+ * Optional `variant` (appended as `:variant`) marks bytes that are NOT the
+ * full compressed chunk — e.g. layer-selective compact chunks keyed by field
+ * mask. The no-variant key always holds full chunk bytes, a superset of every
+ * variant; never store anything else under it.
  */
-export function makeCacheKey(url: string, chunkIndex: number, byteOffset: number): string {
-  return `${fnv1a(url)}:${chunkIndex}:${byteOffset}`
+export function makeCacheKey(url: string, chunkIndex: number, byteOffset: number, variant?: string): string {
+  const base = `${fnv1a(url)}:${chunkIndex}:${byteOffset}`
+  return variant === undefined ? base : `${base}:${variant}`
 }
 
 /** Non-crypto hash. Fast, collision-resistant for URL strings. */
