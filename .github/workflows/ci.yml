@@ -32,6 +32,11 @@ jobs:
           node-version: 22
           cache: pnpm
 
+      - name: Contract boundaries
+        # Core Extension Contract: no add-on names in core/viewer, dependency
+        # direction (core → nothing, viewer → core), fixture uses public API only.
+        run: node scripts/ci/check-boundaries.mjs
+
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
@@ -47,3 +52,40 @@ jobs:
 
       - name: Test
         run: pnpm -r test
+
+  zero-addon:
+    # Core Extension Contract: core and viewer build, typecheck and test with
+    # every other workspace package (add-ons, the socket fixture) deleted.
+    name: Zero-add-on build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        # actions/checkout@v4 — pinned to commit SHA
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Setup pnpm
+        # pnpm/action-setup@v4 — pinned to commit SHA
+        uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa
+
+      - name: Setup Node
+        # actions/setup-node@v4 — pinned to commit SHA
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Remove add-on packages
+        run: node scripts/ci/strip-addons.mjs
+
+      - name: Build core + viewer
+        run: pnpm --filter @lazstream/core --filter @lazstream/viewer build
+
+      - name: Typecheck core + viewer
+        run: pnpm --filter @lazstream/core --filter @lazstream/viewer check
+
+      - name: Test core
+        run: pnpm --filter @lazstream/core test

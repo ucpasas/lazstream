@@ -8,6 +8,7 @@
     "dev":   "pnpm --filter @lazstream/viewer dev",
     "build": "pnpm --filter @lazstream/core build && pnpm --filter @lazstream/viewer build",
     "check": "pnpm -r check",
+    "check:boundaries": "node scripts/ci/check-boundaries.mjs",
     "preview": "pnpm --filter @lazstream/viewer preview"
   }
 }
