@@ -11,7 +11,7 @@
 
 // ── Primary entry point ──────────────────────────────────────────────────────
 export { ManifestSession } from './engine/manifest-session.js'
-export type { ManifestSessionOptions } from './engine/manifest-session.js'
+export type { ManifestSessionOptions, TileInfo, DecodedChunkSubscription } from './engine/manifest-session.js'
 
 // ── Manifest types and helpers ───────────────────────────────────────────────
 export type { Manifest, TileEntry } from './engine/manifest-types.js'
@@ -19,7 +19,11 @@ export { fetchManifest, parseManifest, urlToManifest, ManifestParseError } from 
 
 // ── Lower-level: single-tile engine (advanced use) ───────────────────────────
 export { StreamingEngine } from './engine/streaming-engine.js'
-export type { EngineEvents, LoadState, RingBufferProvider, StreamingEngineOptions } from './engine/streaming-engine.js'
+export type { EngineEvents, LoadState, RingBufferProvider, StreamingEngineOptions, DispatchHold } from './engine/streaming-engine.js'
+
+// ── LAS directory: raw header + VLR / EVLR records (@experimental) ───────────
+export { readLasDirectory } from './engine/las-directory.js'
+export type { LasDirectory, LasDirectoryOptions, LasHeaderRaw, RawVlr, LasCompression } from './engine/las-directory.js'
 
 // ── Provider types — implement these in your renderer ────────────────────────
 export type { CameraInfo, ChunkOrdering, VisibilityTest } from './decode/chunk-priority.js'

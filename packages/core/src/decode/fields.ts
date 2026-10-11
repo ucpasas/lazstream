@@ -27,10 +27,11 @@ const BIT = new Map<LasField, number>(LAS_FIELDS.map((f, i) => [f, 1 << i]))
 export const FIELD_BITS_ALL = (1 << LAS_FIELDS.length) - 1
 export const XYZ_BIT = 1
 
-/** Fields that surface as ChunkAttributes arrays. xyz / classification / rgb
- *  already have native DecodedChunk slots; wavepacket is never surfaced. */
+/** Fields that surface as ChunkAttributes arrays. classification / rgb
+ *  already have native DecodedChunk slots; wavepacket is never surfaced.
+ *  xyz surfaces as `xyzRaw` (exact LAS integers; positions are Int16 render data). */
 export const SURFACEABLE_BITS =
-  (1 << 1) | (1 << 2) | (1 << 3) | (1 << 5) | (1 << 6) | (1 << 7) | (1 << 8) | (1 << 10) | (1 << 12)
+  (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 5) | (1 << 6) | (1 << 7) | (1 << 8) | (1 << 10) | (1 << 12)
 
 export function fieldBit(field: LasField): number {
   const b = BIT.get(field)
