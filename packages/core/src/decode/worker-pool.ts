@@ -51,6 +51,14 @@ export interface LazstreamAssetUrls {
  * the chunk was decoded from appear here.
  */
 export interface ChunkAttributes {
+  /**
+   * Exact LAS integer coordinates, interleaved X Y Z (surface `xyz`). World =
+   * raw × scale + offset from the tile's header. `positions` is a lossy Int16
+   * render format (step = chunk range / 65535); use this for measurement.
+   * If absent despite being demanded, the hosted decode-worker.js predates
+   * core 1.6.0 — keep worker assets on the same version as core.
+   */
+  xyzRaw?: Int32Array
   /** Raw uint16 intensity (intensity8 stays the seed-stretched copy). */
   intensityRaw?: Uint16Array
   returnNumber?: Uint8Array
@@ -480,9 +488,12 @@ export class WorkerPool {
     if (opts.presentBits !== undefined) decoded.fieldsPresent = fromBits(opts.presentBits)
     if (msg.attributes) decoded.attributes = msg.attributes as ChunkAttributes
     if (opts.upgrade) decoded.isUpgrade = true
-    this.events.onChunkDecoded?.(decoded)
-
-    this.dispatchNext(workerState)
+    try {
+      this.events.onChunkDecoded?.(decoded)
+    } finally {
+      // Always move on: a throwing consumer must not leave this worker idle.
+      this.dispatchNext(workerState)
+    }
   }
 
   private handleError(workerState: WorkerState, msg: any): void {

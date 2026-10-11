@@ -44,6 +44,9 @@ describe('surfaced values match spec offsets', () => {
       const inFormat = fieldsInFormat(pdrf, rl)
       for (let i = 0; i < n; i += 7) {
         const p = i * rl
+        expect(out.xyzRaw![i * 3]).toBe(view.getInt32(p, true))
+        expect(out.xyzRaw![i * 3 + 1]).toBe(view.getInt32(p + 4, true))
+        expect(out.xyzRaw![i * 3 + 2]).toBe(view.getInt32(p + 8, true))
         const b14 = records[p + 14]
         const b15 = records[p + 15]
         expect(out.intensityRaw![i]).toBe(view.getUint16(p + 12, true))

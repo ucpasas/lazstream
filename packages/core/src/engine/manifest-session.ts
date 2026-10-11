@@ -21,8 +21,9 @@
  *   tiles continue. If ALL tiles fail, onError fires.
  */
 
-import { StreamingEngine } from './streaming-engine.js'
-import type { EngineEvents, RingBufferProvider, StreamingEngineOptions } from './streaming-engine.js'
+import { StreamingEngine, reportListenerError } from './streaming-engine.js'
+import type { DispatchHold, EngineEvents, RingBufferProvider, StreamingEngineOptions } from './streaming-engine.js'
+import { readLasDirectory, type LasDirectory, type LasDirectoryOptions } from './las-directory.js'
 import type { Manifest } from './manifest-types.js'
 import type { LasHeader, SeedPoint, PointAttributes } from '../types/las.js'
 import type { BBox3D } from '../types/spatial.js'
@@ -35,6 +36,26 @@ import { FieldDemandSet, fromBits, resolveFetchFields, type FieldDemand, type La
 export interface ManifestSessionOptions extends Omit<StreamingEngineOptions, 'events'> {
   events: EngineEvents
 }
+
+/** One manifest tile, as settled when seeds are ready. */
+export interface TileInfo {
+  readonly url: string
+  /** Streaming header; null when the tile failed before its header parsed. */
+  readonly header: LasHeader | null
+  /** First global chunk index of this tile. */
+  readonly chunkOffset: number
+  readonly chunkCount: number
+  /** Valid seeds (≤ chunkCount; seeds failing fetch or bounds are dropped). */
+  readonly seedCount: number
+  /** 'failed' also covers tiles that seeded and failed later (e.g. worker init). */
+  readonly status: 'ok' | 'failed'
+  readonly error?: string
+}
+
+/** Handle from subscribeDecoded(). unsubscribe() is idempotent. */
+export interface DecodedChunkSubscription { unsubscribe(): void }
+
+type MutableTileInfo = { -readonly [K in keyof TileInfo]: TileInfo[K] }
 
 // ─── Session ─────────────────────────────────────────────────────────────────
 
@@ -55,10 +76,37 @@ export class ManifestSession {
     fields: LasField[]; surface: boolean; engineHandles: FieldDemand[]
   }>()
 
+  /** Live dispatch holds, applied to every engine created by load(). */
+  private holds = new Set<{ engineHandles: DispatchHold[] }>()
+  /** subscribeDecoded() listeners (the constructor onChunkDecoded is separate). */
+  private decodedListeners = new Set<(chunk: DecodedChunk) => void>()
+
+  // Settled state — valid once seedsReady resolves.
+  private settled = false
+  private seeds: SeedPoint[] = []
+  private totalChunks = 0
+  private tileInfos: MutableTileInfo[] = []
+
+  /**
+   * Resolves once every tile has seeded or failed and global chunk indices
+   * are final — before the constructor onSeedsReady callback runs. Rejects
+   * if every tile fails, or on dispose() before that point.
+   * @experimental
+   */
+  readonly seedsReady: Promise<void>
+  private resolveSeeds!: () => void
+  private rejectSeeds!: (err: Error) => void
+
   constructor(
     private readonly manifest: Manifest,
     private readonly options: ManifestSessionOptions,
   ) {
+    this.seedsReady = new Promise<void>((resolve, reject) => {
+      this.resolveSeeds = resolve
+      this.rejectSeeds = reject
+    })
+    // Rejection is reported through onError too; don't surface it as unhandled.
+    this.seedsReady.catch(() => {})
     this.demands = new FieldDemandSet(
       resolveFetchFields(options.fetchFields),
       (fetchBits, surfaceBits) => options.events.onFieldsChanged?.(fromBits(fetchBits), fromBits(surfaceBits)),
@@ -113,6 +161,93 @@ export class ManifestSession {
       list.push(localIndex)
     }
     for (const [engine, locals] of perEngine) engine.upgradeChunks(locals)
+  }
+
+  // ─── Extension sockets (wiki [[Extension Sockets — Implementation Plan]]) ──
+
+  /** Total chunks across tiles (global index space size). 0 before seedsReady. @experimental */
+  get chunkCount(): number { return this.totalChunks }
+
+  /** All seeds with global chunk indices. Empty before seedsReady. @experimental */
+  getSeeds(): readonly SeedPoint[] { return this.seeds }
+
+  /** Per-tile identity and status. Empty before seedsReady. @experimental */
+  get tiles(): readonly TileInfo[] { return this.tileInfos }
+
+  /**
+   * Map a global chunk index to its tile. Null before seedsReady or when the
+   * index is outside every tile's range.
+   * @experimental
+   */
+  resolveChunk(globalIndex: number): { tileIndex: number; localIndex: number } | null {
+    if (!this.settled || !Number.isInteger(globalIndex)) return null
+    for (let i = 0; i < this.tileInfos.length; i++) {
+      const t = this.tileInfos[i]
+      if (globalIndex >= t.chunkOffset && globalIndex < t.chunkOffset + t.chunkCount) {
+        return { tileIndex: i, localIndex: globalIndex - t.chunkOffset }
+      }
+    }
+    return null
+  }
+
+  /**
+   * Pause camera-driven dispatch on every tile until released. Take it before
+   * load() (or before seedsReady) so seed-derived decisions — priority bias,
+   * area of interest — are in place before the first chunk is fetched.
+   * Ref-counted; upgrades, T3 picking and decodeAll() are not held.
+   * @experimental
+   */
+  holdDispatch(): DispatchHold {
+    const record = { engineHandles: this.engines.map(e => e.holdDispatch()) }
+    this.holds.add(record)
+    let released = false
+    return {
+      release: () => {
+        if (released) return
+        released = true
+        this.holds.delete(record)
+        for (const h of record.engineHandles) h.release()
+      },
+    }
+  }
+
+  /**
+   * Receive every decoded chunk (global indices), alongside the constructor
+   * onChunkDecoded. Upgrades arrive with isUpgrade: true. `fields` registers
+   * a surfacing demand released on unsubscribe — it also widens render-path
+   * fetches. Listeners run synchronously: treat chunks as read-only and copy
+   * what you keep. A throwing listener is reported via onWarning and never
+   * affects other listeners or decoding.
+   * @experimental
+   */
+  subscribeDecoded(
+    listener: (chunk: DecodedChunk) => void,
+    opts: { fields?: Iterable<LasField> } = {},
+  ): DecodedChunkSubscription {
+    const entry = (chunk: DecodedChunk) => listener(chunk)
+    const demand = opts.fields ? this.demandFields(opts.fields, { surface: true }) : null
+    this.decodedListeners.add(entry)
+    let done = false
+    return {
+      unsubscribe: () => {
+        if (done) return
+        done = true
+        this.decodedListeners.delete(entry)
+        demand?.release()
+      },
+    }
+  }
+
+  /**
+   * Raw header + VLR (optionally EVLR) directory of one tile. Reuses the
+   * header bytes the tile already fetched; tiles that failed before their
+   * header (e.g. uncompressed LAS) are read fresh, so failures can be inspected.
+   * @experimental
+   */
+  async getDirectory(tileIndex: number, opts: LasDirectoryOptions = {}): Promise<LasDirectory> {
+    const tile = this.manifest.tiles[tileIndex]
+    if (!tile) throw new RangeError(`No tile ${tileIndex} (manifest has ${this.manifest.tiles.length})`)
+    return (await this.engines[tileIndex]?.getDirectory(opts)) ?? readLasDirectory(tile.url, opts)
   }
 
   /** Register camera position provider — forwarded to all tile engines. */
@@ -171,6 +306,8 @@ export class ManifestSession {
     for (const e of this.engines) e.dispose()
     this.engines = []
     this.offsets = []
+    this.decodedListeners.clear()
+    if (!this.settled) this.rejectSeeds(new DOMException('ManifestSession disposed', 'AbortError'))
   }
 
   /**
@@ -203,6 +340,10 @@ export class ManifestSession {
     const collectedHeaders = new Array<LasHeader | null>(tileCount).fill(null)
     let tilesSettled = 0
     let tilesSucceeded = 0
+    // A tile that seeds and later fails (e.g. worker init) reports twice; it
+    // must settle once, or offsets are recomputed and onSeedsReady re-fires.
+    const tileSettled = new Array<boolean>(tileCount).fill(false)
+    const tileErrors = new Array<string | undefined>(tileCount)
 
     // Shared aggregation state for multi-tile status/stats
     const agg: TileAgg = {
@@ -215,7 +356,9 @@ export class ManifestSession {
       if (tilesSettled < tileCount) return
 
       if (tilesSucceeded === 0) {
-        events.onError?.(new Error('All manifest tiles failed to load.'))
+        const err = new Error('All manifest tiles failed to load.')
+        this.rejectSeeds(err)
+        events.onError?.(err)
         return
       }
 
@@ -243,6 +386,21 @@ export class ManifestSession {
       }
 
       const combinedHeader = mergeHeaders(validHeaders)
+
+      this.seeds = allSeeds
+      this.totalChunks = runningOffset
+      this.tileInfos = tiles.map((tile, i) => ({
+        url: tile.url,
+        header: collectedHeaders[i],
+        chunkOffset: this.offsets[i],
+        chunkCount: this.engines[i]?.chunkCount ?? 0,
+        seedCount: collectedSeeds[i]?.length ?? 0,
+        status: collectedSeeds[i] ? 'ok' : 'failed',
+        ...(tileErrors[i] !== undefined ? { error: tileErrors[i] } : {}),
+      }))
+      this.settled = true
+      this.resolveSeeds()
+
       events.onSeedsReady?.(allSeeds, combinedHeader)
     }
 
@@ -253,8 +411,19 @@ export class ManifestSession {
 
       const tileEvents = this.makeTileEvents(
         tileIndex, tileUrl, tileCount, events, agg,
-        () => { tilesSucceeded++; tilesSettled++; checkAllSettled() },
-        () => {                   tilesSettled++; checkAllSettled() },
+        () => {
+          if (tileSettled[tileIndex]) return
+          tileSettled[tileIndex] = true
+          tilesSucceeded++; tilesSettled++; checkAllSettled()
+        },
+        (message) => {
+          tileErrors[tileIndex] = message
+          const info = this.tileInfos[tileIndex]
+          if (info) { info.status = 'failed'; info.error = message }
+          if (tileSettled[tileIndex]) return
+          tileSettled[tileIndex] = true
+          tilesSettled++; checkAllSettled()
+        },
         collectedSeeds, collectedHeaders,
       )
 
@@ -271,10 +440,11 @@ export class ManifestSession {
         topUpMemoryBytes,
       })
 
-      // Demands made before (or during) load apply to every tile engine.
+      // Demands and holds made before (or during) load apply to every tile engine.
       for (const d of this.liveDemands) {
         d.engineHandles.push(engine.demandFields(d.fields, { surface: d.surface }))
       }
+      for (const h of this.holds) h.engineHandles.push(engine.holdDispatch())
 
       // Register providers that were set before load()
       if (this.cameraProvider)   engine.setCameraProvider(this.cameraProvider)
@@ -316,7 +486,7 @@ export class ManifestSession {
     outer: EngineEvents,
     agg: TileAgg,
     onSeeded: () => void,
-    onFailed: () => void,
+    onFailed: (message: string) => void,
     collectedSeeds: Array<SeedPoint[] | null>,
     collectedHeaders: Array<LasHeader | null>,
   ): EngineEvents {
@@ -374,10 +544,21 @@ export class ManifestSession {
       onChunkDecoded: (chunk: DecodedChunk) => {
         // Offset is set by checkAllSettled() before any decode dispatches.
         const offset = this.offsets[tileIndex] ?? 0
-        outer.onChunkDecoded?.({
-          ...chunk,
-          chunkIndex: chunk.chunkIndex + offset,
-        })
+        const global = { ...chunk, chunkIndex: chunk.chunkIndex + offset }
+        // Each consumer is isolated: one throwing never starves the others.
+        try {
+          outer.onChunkDecoded?.(global)
+        } catch (err) {
+          reportListenerError(outer, 'onChunkDecoded', err)
+        }
+        if (this.decodedListeners.size === 0) return
+        for (const listener of [...this.decodedListeners]) {
+          try {
+            listener(global)
+          } catch (err) {
+            reportListenerError(outer, 'subscribeDecoded', err)
+          }
+        }
       },
 
       onError: (err) => {
@@ -385,7 +566,7 @@ export class ManifestSession {
         outer.onWarning?.(
           `Tile ${tileIndex + 1} failed to load (${tileUrl}): ${err.message}`
         )
-        onFailed()
+        onFailed(err.message)
       },
     }
   }

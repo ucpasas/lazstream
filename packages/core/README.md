@@ -253,6 +253,62 @@ consumers should take them. Upgrades run behind visible-chunk dispatch.
 
 ---
 
+## Extension sockets (experimental, 1.6.0)
+
+Generic hooks for add-ons and analysis tools that run on the same session as
+a renderer — or with no renderer at all. All are opt-in: a session that uses
+none of them behaves exactly as in 1.5.0.
+
+```typescript
+const session = new ManifestSession(manifest, { events })
+
+// Pause camera-driven decoding until seed-based decisions are in place.
+const hold = session.holdDispatch()
+void session.load()
+await session.seedsReady                 // global chunk indices are now final
+
+session.getSeeds()                       // one seed per chunk, global indices
+session.chunkCount                       // total chunks across tiles
+session.tiles                            // [{ url, header, chunkOffset, chunkCount, seedCount, status, error? }]
+session.resolveChunk(globalIndex)        // → { tileIndex, localIndex } | null
+hold.release()
+
+// Every decoded chunk, alongside onChunkDecoded. `fields` demands + surfaces.
+const sub = session.subscribeDecoded(chunk => { /* read-only; copy what you keep */ },
+  { fields: ['xyz', 'gpsTime'] })
+sub.unsubscribe()                        // also releases the demand
+```
+
+- **Exact coordinates.** `positions` is a lossy Int16 render format (step =
+  chunk range / 65535). Surface `xyz` to get `attributes.xyzRaw`: the LAS
+  integers, interleaved, with world = raw × scale + offset from the tile's
+  header. Keep a self-hosted `decode-worker.js` on the same version as core,
+  or `xyzRaw` is silently absent.
+- **Listener errors** (here and in `onChunkDecoded`) are caught, logged and
+  reported through `onWarning`; decoding continues.
+
+### LAS directory
+
+Raw header fields and VLR / EVLR records, for auditing files — including ones
+lazstream cannot stream. Fetches only the header block (EVLRs on request).
+
+```typescript
+import { readLasDirectory } from '@lazstream/core'
+
+const dir = await readLasDirectory(url, { includeEvlrs: true, includeData: true })
+dir.header        // every public-header field as stored (system identifier, software, dates, GUID, EVLR offsets…)
+dir.vlrs          // [{ kind: 'vlr' | 'evlr', userId, recordId, description, length, data? }]
+dir.compression   // 'laz' | 'none' | 'unknown'
+dir.streamable    // false for LAS 1.0/1.1, uncompressed LAS, … (reported in dir.warnings, not thrown)
+
+await session.getDirectory(tileIndex)    // same, reusing the tile's fetched header bytes
+```
+
+It throws only for invalid URLs, network errors, and bytes that are not a LAS
+file. Interpreting records (CRS, Extra Bytes, vendor) is left to the caller.
+
+---
+
 ## Data utilities
 
 ```typescript
@@ -389,6 +445,7 @@ interface DecodedChunk {
 }
 
 interface ChunkAttributes {
+  xyzRaw?: Int32Array                    // exact LAS integers, X Y Z interleaved (surface 'xyz')
   intensityRaw?: Uint16Array             // unstretched (intensity8 is the stretched copy)
   returnNumber?: Uint8Array
   numberOfReturns?: Uint8Array

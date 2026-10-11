@@ -30,6 +30,7 @@ import { validateSourceUrl } from '../network/url-validator.js'
 import { probeUrl, fetchRange } from '../network/range-fetcher.js'
 import { coalesceRanges, DEFAULT_MAX_GAP_BYTES, type RangeItem } from '../network/batch-fetcher.js'
 import { fetchAndParseLasHeader, ParseError } from './header-parser.js'
+import { directoryFromHeaderBytes, type LasDirectory, type LasDirectoryOptions } from './las-directory.js'
 import { fetchChunkTable, fetchSeedPoints } from './chunk-table.js'
 import { WorkerPool } from '../decode/worker-pool.js'
 import type { DecodedChunk, LazstreamAssetUrls } from '../decode/worker-pool.js'
@@ -131,6 +132,18 @@ export interface EngineEvents {
   onFieldsChanged?: (fetch: ReadonlySet<LasField>, surface: ReadonlySet<LasField>) => void
 }
 
+/** Handle from holdDispatch(). release() is idempotent. */
+export interface DispatchHold { release(): void }
+
+/** Report an exception thrown by a consumer callback without propagating it. */
+export function reportListenerError(events: Pick<EngineEvents, 'onWarning'>, name: string, err: unknown): void {
+  console.error(`[lazstream] ${name} listener threw:`, err)
+  const message = err instanceof Error ? err.message : String(err)
+  try {
+    events.onWarning?.(`${name} listener threw: ${message}`)
+  } catch { /* a throwing onWarning must not re-enter */ }
+}
+
 /** Provider returning current ring buffer state. Used to gate dispatch when the buffer is nearly full. */
 export type RingBufferProvider = () => { slotsFree: number; slotsTotal: number }
 
@@ -179,6 +192,10 @@ export class StreamingEngine {
   private decodedPointCount = 0
   private decodedChunkCount = 0
   private fileSize = 0
+  /** Header + VLR bytes from the header fetch, kept for getDirectory(). */
+  private headerBytes: ArrayBuffer | null = null
+  /** Live holdDispatch() handles. Survives load(), like field demands. */
+  private dispatchHolds = 0
 
   // Providers — renderer registers these so engine stays renderer-agnostic.
   private cameraInfoProvider:  (() => CameraInfo)        | null = null
@@ -311,6 +328,7 @@ export class StreamingEngine {
     this.decodedPointCount = 0
     this.decodedChunkCount = 0
     this.fileSize = 0
+    this.headerBytes = null
     this.fetching = new Set()
     this.layered = false
     this.layerNameList = []
@@ -348,8 +366,9 @@ export class StreamingEngine {
       }
 
       this.emit('header', 'Reading file header...')
-      const { header, lazVlr } = await fetchAndParseLasHeader(this.url, signal)
+      const { header, lazVlr, buffer } = await fetchAndParseLasHeader(this.url, signal)
       this.header = header
+      this.headerBytes = buffer
 
       const lazVersion = classifyLazVersion(header, lazVlr)
       const warning = getLazVersionWarning(lazVersion)
@@ -433,8 +452,9 @@ export class StreamingEngine {
   /** Update the decode queue based on current camera position. Call every frame from the render loop. */
   updateCamera(): void {
     if (!this.prioritiser || !this.workerPool || !this.workersConfigured) return
-    this.dispatchVisible()
+    if (this.dispatchHolds === 0) this.dispatchVisible()
     // Upgrades go after visible dispatch so they never delay new chunks.
+    // Not held: they only re-decode chunks consumers already have.
     this.pumpUpgrades()
   }
 
@@ -524,6 +544,35 @@ export class StreamingEngine {
 
   /** Number of chunks in this file's chunk table. Available after load() passes the chunk-table stage. */
   get chunkCount(): number { return this.chunks.length }
+
+  /**
+   * Pause camera-driven dispatch until every hold is released. Ref-counted and
+   * survives load(). Upgrades, T3 picking and decodeAll() are not held. With
+   * no hold taken the engine behaves exactly as before.
+   * @experimental
+   */
+  holdDispatch(): DispatchHold {
+    this.dispatchHolds++
+    let released = false
+    return {
+      release: () => {
+        if (released) return
+        released = true
+        this.dispatchHolds--
+      },
+    }
+  }
+
+  /**
+   * Raw header + VLR (and optionally EVLR) directory of this file, from the
+   * header bytes load() already fetched (EVLRs cost extra range requests).
+   * Null before the header stage — use readLasDirectory(url) instead.
+   * @experimental
+   */
+  getDirectory(opts: LasDirectoryOptions = {}): Promise<LasDirectory> | null {
+    if (!this.headerBytes) return null
+    return directoryFromHeaderBytes(this.url, this.headerBytes, this.fileSize || undefined, opts)
+  }
 
   /**
    * T3 picking: resolve full attributes for a single point.
@@ -1102,7 +1151,7 @@ export class StreamingEngine {
         // Re-emission of a chunk consumers already have: no counters, no
         // spatial/prioritiser changes, no 'ready' — only the new fields.
         this.decodedMask.set(idx, bits)
-        this.events.onChunkDecoded?.(chunk)
+        this.emitDecoded(chunk)
         this.recheckUpgrade(idx)
         return
       }
@@ -1122,7 +1171,7 @@ export class StreamingEngine {
     this.decodedChunkCount++
     this.decodedPointCount += chunk.pointCount
 
-    this.events.onChunkDecoded?.(chunk)
+    this.emitDecoded(chunk)
     this.emitStats()
     this.recheckUpgrade(idx)
 
@@ -1134,6 +1183,17 @@ export class StreamingEngine {
 
     if (this.decodedChunkCount >= this.chunks.length) {
       this.emit('ready', 'Ready')
+    }
+  }
+
+  /** Deliver a decoded chunk to the consumer. A throwing consumer is reported
+   *  and contained: engine bookkeeping still runs and the worker moves on
+   *  (before 1.6.0 a throw left that worker idle for the rest of the load). */
+  private emitDecoded(chunk: DecodedChunk): void {
+    try {
+      this.events.onChunkDecoded?.(chunk)
+    } catch (err) {
+      reportListenerError(this.events, 'onChunkDecoded', err)
     }
   }
 

@@ -66,6 +66,7 @@ const LAYOUTS: Record<number, FormatLayout> = {
 
 /** Mirrors the public ChunkAttributes type (decode/worker-pool.ts). */
 export interface SurfacedAttributes {
+  xyzRaw?: Int32Array
   intensityRaw?: Uint16Array
   returnNumber?: Uint8Array
   numberOfReturns?: Uint8Array
@@ -83,8 +84,9 @@ export interface SurfacedAttributes {
  * Allocate output arrays for the requested fields that exist in this format.
  * Returns null when nothing is to be surfaced (the default path stays
  * byte-identical: no `attributes` key in the worker message at all).
- * xyz / classification / rgb have native DecodedChunk slots and wavepacket is
- * never surfaced, so those bits are ignored.
+ * classification / rgb have native DecodedChunk slots and wavepacket is never
+ * surfaced, so those bits are ignored. xyz surfaces as xyzRaw: the exact LAS
+ * integers, which the Int16 render positions only approximate.
  */
 export function allocSurfacedAttributes(
   surfaceBits: number, pdrf: number, recordLength: number, pointCount: number,
@@ -93,6 +95,7 @@ export function allocSurfacedAttributes(
   if (!layout || surfaceBits === 0) return null
   const out: SurfacedAttributes = {}
   let any = false
+  if (surfaceBits & FIELD_BIT.xyz) { out.xyzRaw = new Int32Array(pointCount * 3); any = true }
   if (surfaceBits & FIELD_BIT.intensity) { out.intensityRaw = new Uint16Array(pointCount); any = true }
   if (surfaceBits & FIELD_BIT.returns) {
     out.returnNumber = new Uint8Array(pointCount)
@@ -125,6 +128,12 @@ export function readSurfacedPoint(
   view: DataView, ptr: number, i: number, pdrf: number, out: SurfacedAttributes,
 ): void {
   const layout = LAYOUTS[pdrf]
+  if (out.xyzRaw) {
+    // Bytes 0–11 of every PDRF: int32 X, Y, Z (unscaled).
+    out.xyzRaw[i * 3]     = view.getInt32(ptr, true)
+    out.xyzRaw[i * 3 + 1] = view.getInt32(ptr + 4, true)
+    out.xyzRaw[i * 3 + 2] = view.getInt32(ptr + 8, true)
+  }
   if (out.intensityRaw) out.intensityRaw[i] = view.getUint16(ptr + 12, true)
   if (out.returnNumber) {
     const b = view.getUint8(ptr + 14)
@@ -162,7 +171,7 @@ export function readSurfacedPoint(
 /** ArrayBuffers to add to the postMessage transfer list. */
 export function surfacedTransferList(out: SurfacedAttributes): ArrayBuffer[] {
   const list: ArrayBuffer[] = []
-  for (const v of [out.intensityRaw, out.returnNumber, out.numberOfReturns, out.flags,
+  for (const v of [out.xyzRaw, out.intensityRaw, out.returnNumber, out.numberOfReturns, out.flags,
     out.scanAngle, out.userData, out.pointSourceId, out.gpsTime, out.nir, out.extraBytes?.data]) {
     if (v) list.push(v.buffer as ArrayBuffer)
   }
