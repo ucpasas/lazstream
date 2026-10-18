@@ -203,8 +203,15 @@ export class WorkerPool {
 
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
+        // No worker ever started: almost always the worker script didn't load
+        // (404 / HTML fallback) — say which URL, and how to point at the files.
+        const hint = this.readyCount === 0
+          ? `. Could not start ${String(workerUrl)} — if your bundler or host didn't ship ` +
+            `lazstream's worker assets (decode-worker.js, laz-perf-worker.js, laz-perf-worker.wasm), ` +
+            `serve them and pass assetUrls`
+          : ''
         reject(new Error(
-          `Worker pool init timed out — only ${this.readyCount}/${this.targetCount} workers ready`
+          `Worker pool init timed out — only ${this.readyCount}/${this.targetCount} workers ready${hint}`
         ))
       }, 15_000)
 
@@ -257,10 +264,13 @@ export class WorkerPool {
         }
 
         worker.onerror = (err: ErrorEvent) => {
+          // A module worker that fails to load reports an ErrorEvent with no
+          // message / filename — include the script URL so the cause is findable.
           console.error(`[lazstream] worker ${i} uncaught error:`, {
-            message: err.message,
+            message: err.message ?? '(no message — worker script failed to load?)',
             filename: err.filename,
             lineno: err.lineno,
+            workerUrl: String(workerUrl),
           })
           // Clean up in-flight tracking. Do NOT call dispatchNext — if this
           // fired from a WASM abort (e.g. unsupported layered LAZ format), the
