@@ -1,3 +1,22 @@
+## 1.6.1 — 2026-10-18
+
+### Fixed
+- **Decode workers now start in consumer production builds.** Since 1.3.0, a
+  Vite production build of an app using lazstream shipped none of
+  `decode-worker.js`, `laz-perf-worker.js` or `laz-perf-worker.wasm`:
+  `dist/index.js` referenced them in forms bundlers are told to skip
+  (`/* @vite-ignore */`, `new URL(x, "" + import.meta.url)`). The worker URL
+  then resolved to the app's HTML fallback, every worker failed to load, and
+  only seed points rendered. `dist/index.js` now uses the plain
+  `new URL("./<file>", import.meta.url)` form, so bundlers emit the files
+  (verified with Vite; it is the standard asset form webpack 5 and Parcel also
+  recognise). Dev servers, native ESM / CDN use, and explicit `assetUrls` are
+  unaffected; asset file names in `dist/` are unchanged.
+- Worker start-up failures are diagnosable: the console error names the worker
+  script URL (a failed module-worker load reports no message), and the
+  "Worker pool init timed out" error says which URL could not start and points
+  to `assetUrls` when no worker came up.
+
 ## 1.6.0 — 2026-10-10
 
 Extension sockets, Phase 1 (all `@experimental`, all opt-in — a session that

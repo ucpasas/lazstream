@@ -351,6 +351,8 @@ export default defineConfig({
 })
 ```
 
+`vite build` emits lazstream's runtime assets (`decode-worker.js`, `laz-perf-worker.js`, `laz-perf-worker.wasm`) into your build automatically — no copying, no `assetUrls`. *(1.6.1+. On 1.3.0–1.6.0 production builds omitted them and every decode worker failed to start; upgrade, or serve the three files from `node_modules/@lazstream/core/dist/` and pass `assetUrls`.)*
+
 ### webpack 5
 
 ```javascript

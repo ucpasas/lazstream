@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>lazstream socket harness</title>
+  <style>
+    body { font: 13px/1.5 ui-monospace, monospace; margin: 16px; background: #fff; color: #111; }
+    .pass { color: #0a7d32; } .fail { color: #b3261e; font-weight: bold; }
+    @media (prefers-color-scheme: dark) { body { background: #111; color: #ddd; } .pass { color: #5ccf7f; } .fail { color: #ff8a80; } }
+  </style>
+</head>
+<body>
+  <h1>lazstream socket harness</h1>
+  <p>Headless <code>ManifestSession</code> against the built <code>@lazstream/core</code>.
+     <code>?url=&lt;https LAZ&gt;</code> runs the checks against a cloud file;
+     <code>&amp;chunks=N</code> caps decodes (default 24 in that mode).</p>
+  <pre id="out">running…</pre>
+  <script type="module" src="./harness.ts"></script>
+</body>
+</html>

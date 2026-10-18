@@ -1,0 +1,105 @@
+name: Browser smoke
+
+# T3 browser harness (packages/_socket-fixture/browser): runs the shipped
+# extension sockets through the BUILT @lazstream/core in headless Chromium —
+# real laz-perf WASM in real Web Workers, Range fetches, no fake worker.
+# Separate workflow so it can carry a path filter (wiki [[Extension Sockets —
+# Build Plan]] PR-0, decision D6). Fixtures are served locally: no cloud access,
+# no secrets. Runners have no GPU; the harness doesn't need one.
+#
+# Note: a path-filtered workflow that doesn't run leaves a required status
+# check pending. If this becomes a required check, move the filter into the job.
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'packages/core/**'
+      - 'packages/viewer/**'
+      - 'packages/_socket-fixture/**'
+      - 'pnpm-lock.yaml'
+      - '.github/workflows/smoke.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'packages/core/**'
+      - 'packages/viewer/**'
+      - 'packages/_socket-fixture/**'
+      - 'pnpm-lock.yaml'
+      - '.github/workflows/smoke.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: Socket harness (${{ matrix.server }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # dev  = consumer `vite` dev server
+        # prod = consumer `vite build` + `vite preview` (what a built app ships)
+        server: [dev, prod]
+
+    steps:
+      - name: Checkout
+        # actions/checkout@v4 — pinned to commit SHA
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Setup pnpm
+        # pnpm/action-setup@v4 — pinned to commit SHA
+        uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa
+
+      - name: Setup Node
+        # actions/setup-node@v4 — pinned to commit SHA
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build core + viewer
+        run: pnpm build
+
+      - name: Playwright version
+        id: pw
+        run: echo "version=$(pnpm --filter @lazstream/socket-fixture exec playwright --version | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Playwright browsers
+        # actions/cache@v4 — pinned to commit SHA
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        id: pw-cache
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ steps.pw.outputs.version }}
+
+      - name: Install Chromium
+        if: steps.pw-cache.outputs.cache-hit != 'true'
+        run: pnpm --filter @lazstream/socket-fixture exec playwright install --with-deps chromium
+
+      - name: Install Chromium system deps (cache hit)
+        if: steps.pw-cache.outputs.cache-hit == 'true'
+        run: pnpm --filter @lazstream/socket-fixture exec playwright install-deps chromium
+
+      - name: Run harness (dev server)
+        if: matrix.server == 'dev'
+        run: pnpm --filter @lazstream/socket-fixture harness:test:dev
+
+      - name: Run harness (production build)
+        if: matrix.server == 'prod'
+        run: pnpm --filter @lazstream/socket-fixture harness:test
+
+      - name: Upload Playwright report
+        if: failure()
+        # actions/upload-artifact@v4 — pinned to commit SHA
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: playwright-report-${{ matrix.server }}
+          path: |
+            packages/_socket-fixture/playwright-report/
+            packages/_socket-fixture/test-results/
+          retention-days: 7
