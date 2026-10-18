@@ -7,6 +7,10 @@ dist-app/
 dist-ssr/
 *.tgz
 
+# Playwright (packages/_socket-fixture harness)
+test-results/
+playwright-report/
+
 # TypeScript
 *.tsbuildinfo
 

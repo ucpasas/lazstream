@@ -7,8 +7,9 @@
 //   3. Imports     — core/viewer source never imports another @lazstream/*
 //      package except viewer → @lazstream/core, and never relative-imports
 //      outside its own package (allowlist below).
-//   4. Fixture     — packages/_socket-fixture imports core/viewer only through
-//      their published `exports` entry points (no deep / relative paths).
+//   4. Fixture     — packages/_socket-fixture (src/ and the browser/ harness)
+//      imports core/viewer only through their published `exports` entry
+//      points (no deep / relative paths).
 //
 // Usage: node scripts/ci/check-boundaries.mjs   (exit 1 on any violation)
 import fs from 'node:fs'
@@ -132,7 +133,8 @@ if (fs.existsSync(path.join(ROOT, FIXTURE_DIR))) {
     ...publicEntries(PACKAGES.core.dir),
     ...publicEntries(PACKAGES.viewer.dir),
   ])
-  for (const file of walk(path.join(FIXTURE_DIR, 'src'))) {
+  // src/ = type-level contract; browser/ = runtime harness. Both public-API only.
+  for (const file of [...walk(path.join(FIXTURE_DIR, 'src')), ...walk(path.join(FIXTURE_DIR, 'browser'))]) {
     const source = fs.readFileSync(path.join(ROOT, file), 'utf8')
     for (const { spec, line } of specifiers(source)) {
       if (spec.startsWith('@lazstream/') && !allowed.has(spec)) {
